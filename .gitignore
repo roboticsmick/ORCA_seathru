@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+*.egg
+
+# Local run outputs
+seathru_out*/
+*_seathru.png
+*_debug.png
+survey_stats.json
+
+.DS_Store
+Thumbs.db

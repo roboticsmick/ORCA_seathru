@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seathru_python"
+version = "0.1.0"
+description = "Physically based removal of water from underwater images (Sea-thru, CVPR 2019) for ORCA ASV reef mapping"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-image>=0.21",
+    "pillow>=9.0",
+]
+
+[project.optional-dependencies]
+debug = ["matplotlib>=3.6"]
+mono = ["torch", "torchvision"]   # requires Python <= 3.12
+
+[project.scripts]
+seathru = "seathru.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["seathru*"]

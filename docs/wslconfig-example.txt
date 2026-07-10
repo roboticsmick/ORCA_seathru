@@ -1,0 +1,23 @@
+# Example .wslconfig — copy to  C:\Users\mickv\.wslconfig  (Windows side).
+#
+# Caps how much of your machine WSL2 (and therefore COLMAP) can ever take, so
+# Windows + Fusion 360 always keep the rest. This is a hard guarantee that does
+# not depend on `nice`. Tune to taste.
+#
+# Your machine: Ryzen 7 5800H = 16 logical processors, 32 GB RAM.
+# Below leaves Windows/Fusion 10 cores and ~20 GB while COLMAP runs.
+#
+# After editing, apply with:  wsl --shutdown   (then reopen your WSL terminal)
+
+[wsl2]
+# CPUs visible to WSL. COLMAP can't use more than this no matter what.
+processors=6
+
+# RAM ceiling for the whole WSL VM.
+memory=12GB
+
+# Swap on the WSL side (helps avoid OOM on big bundle adjustments).
+swap=8GB
+
+# Keep the GPU available inside WSL (needed only for GPU feature/match/dense).
+gpuSupport=true

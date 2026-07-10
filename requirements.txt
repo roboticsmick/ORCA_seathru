@@ -1,0 +1,10 @@
+# Core Sea-thru pipeline (no deep learning required)
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+pillow>=9.0
+matplotlib>=3.6   # only for --debug montages
+
+# Optional: monocular depth (--depth mono). Install in a Python <=3.12 env,
+# torch has no wheels for 3.14 yet.
+#   pip install torch torchvision
