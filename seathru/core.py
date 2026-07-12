@@ -309,7 +309,8 @@ def _spread_samples(x, y, radius_fraction=0.01):
 
 
 def refine_attenuation(depths, illum, coarse, restarts=10,
-                       min_depth_fraction=0.1, l=1.0, spread_fraction=0.01):
+                       min_depth_fraction=0.1, l=1.0, spread_fraction=0.01,
+                       mode="two-term"):
     """
     @brief Equations 16-17: fit the two-term-exponential beta_D(z) so the implied
     range matches the known range map.
@@ -323,10 +324,25 @@ def refine_attenuation(depths, illum, coarse, restarts=10,
     @param l Attenuation/brightness balance knob (tunable, see SeathruParams.l);
         scales the final coefficient, matching the reference implementation.
     @param spread_fraction Sample-thinning window, see _spread_samples.
+    @param mode ``"two-term"`` (default) fits the paper's Equation 11 decaying
+        two-term exponential. ``"coarse"`` skips the fit and uses the raw
+        illuminant-derived beta_D (Equation 12) directly.
+
+        Use ``"coarse"`` for **downward-looking** surveys with real depth relief
+        (e.g. a reef dropoff). Equation 2 is derived for *horizontal* imaging,
+        where every object sits at the same depth so the ambient light is
+        constant and beta_D genuinely *decays* with range — which is why Eq. 11
+        is a sum of decaying exponentials (both exponents are constrained <= 0).
+        Looking straight down, range ~= depth, so deeper pixels are lit by much
+        redder-depleted light and the true beta_D *rises* with range. The
+        decaying two-term form cannot represent that, and silently flattens the
+        correction exactly where the water column is thickest.
     @return Tuple ``(beta_D_map, coefs)``. ``coefs`` is the fitted 4-parameter
         Equation 11 coefficients, or ``None`` if the fit is skipped/degenerate
         (fewer than 8 usable samples) or falls back to a 2-parameter linear fit.
     """
+    if mode == "coarse":
+        return l * coarse, None
     valid = depths > 0
     z_min, z_max = depths[valid].min(), depths[valid].max()
     min_depth = z_min + min_depth_fraction * (z_max - z_min)
@@ -531,6 +547,7 @@ class SeathruParams:
     backscatter_restarts: int = 25
     attenuation_restarts: int = 10
     spread_fraction: float = 0.01
+    attenuation_mode: str = "two-term"
     locked_stats: "SurveyStats | None" = None
     return_debug: bool = False
 
@@ -684,7 +701,10 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
     nmap, n = construct_neighborhood_map(depths, params.epsilon,
                                          params.min_neighborhood)
 
-    need_attenuation_fit = locked is None or locked.attenuation_coefs is None
+    # "coarse" mode derives beta_D from this image's illuminant map, so it needs
+    # the illuminant even when locked (two-term) coefficients are available.
+    need_attenuation_fit = (locked is None or locked.attenuation_coefs is None
+                            or params.attenuation_mode == "coarse")
     need_illum = params.return_debug or need_attenuation_fit
     illum = None
     if need_illum:
@@ -693,7 +713,10 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
                                   p=params.p, f=params.f)
             for c in range(3)], axis=2)
 
-    if locked is not None and locked.attenuation_coefs is not None:
+    # Locked coefficients are two-term (Eq. 11) fits, so they do not apply in
+    # "coarse" mode, where beta_D comes straight from this image's illuminant.
+    if (params.attenuation_mode != "coarse"
+            and locked is not None and locked.attenuation_coefs is not None):
         beta_D = np.stack([params.l * _beta_D_two_term(depths, *locked.attenuation_coefs[c])
                           for c in range(3)], axis=2)
     else:
@@ -701,7 +724,8 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
             refine_attenuation(depths, illum[..., c],
                                coarse_attenuation(depths, illum[..., c]),
                                restarts=params.attenuation_restarts,
-                               l=params.l, spread_fraction=params.spread_fraction)[0]
+                               l=params.l, spread_fraction=params.spread_fraction,
+                               mode=params.attenuation_mode)[0]
             for c in range(3)], axis=2)
 
     wb_gains = locked.wb_gains if locked is not None else None
@@ -738,18 +762,21 @@ def upsample_and_recover(full_img, full_depths, result: "SeathruResult",
     @pre ``result`` was produced with ``return_debug=True`` (its backscatter,
         beta_D, and neighborhood_map fields must be populated).
     """
-    import cv2
+    from skimage.transform import resize as _sk_resize
 
     assert result.backscatter is not None and result.beta_D is not None, \
         "upsample_and_recover needs a SeathruResult from a return_debug=True run"
 
     H, W = full_img.shape[:2]
-    B = cv2.resize(result.backscatter.astype(np.float32), (W, H),
-                   interpolation=cv2.INTER_LINEAR)
-    beta_D = cv2.resize(result.beta_D.astype(np.float32), (W, H),
-                        interpolation=cv2.INTER_LINEAR)
-    nmap = cv2.resize(result.neighborhood_map.astype(np.int32), (W, H),
-                      interpolation=cv2.INTER_NEAREST)
+
+    def _resize(arr, order):
+        out_shape = (H, W) + arr.shape[2:]
+        return _sk_resize(arr.astype(np.float32), out_shape, order=order,
+                          mode="edge", anti_aliasing=False, preserve_range=True)
+
+    B = _resize(result.backscatter, 1)          # bilinear
+    beta_D = _resize(result.beta_D, 1)           # bilinear
+    nmap = _resize(result.neighborhood_map, 0).astype(np.int32)   # nearest
     locked = params.locked_stats
     wb_gains = locked.wb_gains if locked is not None else None
     stretch_bounds = (locked.stretch_bounds
@@ -835,7 +862,7 @@ def _fit_calibration_sample(img, depths, params: SeathruParams):
         atten_coefs.append(coefs if (coefs is not None and coefs.shape == (4,)) else None)
     attenuation_coefs = None if any(c is None for c in atten_coefs) else np.stack(atten_coefs)
 
-    if attenuation_coefs is not None:
+    if params.attenuation_mode != "coarse" and attenuation_coefs is not None:
         beta_D = np.stack([params.l * _beta_D_two_term(depths, *attenuation_coefs[c])
                           for c in range(3)], axis=2)
     else:
@@ -843,7 +870,8 @@ def _fit_calibration_sample(img, depths, params: SeathruParams):
             refine_attenuation(depths, illum_channels[c],
                                coarse_attenuation(depths, illum_channels[c]),
                                restarts=params.attenuation_restarts,
-                               l=params.l, spread_fraction=params.spread_fraction)[0]
+                               l=params.l, spread_fraction=params.spread_fraction,
+                               mode=params.attenuation_mode)[0]
             for c in range(3)], axis=2)
 
     direct = _compute_direct(img, depths, B, beta_D, nmap)

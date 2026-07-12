@@ -49,17 +49,27 @@ def read_colmap_array(path):
 class ColmapDepthSource(DepthSource):
     """@brief Metric depth from a COLMAP dense-MVS workspace; see module docstring."""
 
-    def __init__(self, workspace, kind="geometric", clip_percentile=99.5):
+    def __init__(self, workspace, kind="geometric", clip_percentile=99.5,
+                 clip_low_percentile=2.0):
         """
         @param workspace COLMAP dense workspace directory (containing ``stereo/``).
         @param kind ``"geometric"`` (recommended, multi-view consistent) or
             ``"photometric"`` depth-map variant.
         @param clip_percentile Depths above this percentile (of the valid
             pixels in this image) are marked invalid, to drop MVS outliers.
+        @param clip_low_percentile Depths *below* this percentile are marked
+            invalid. MVS produces spurious near-camera points (e.g. 0.2 m on a
+            reef imaged from 3 m). These matter far more than they look: the
+            coarse attenuation estimate is ``beta = -ln(illuminant) / z``, so a
+            tiny ``z`` explodes beta, and ``_spread_samples`` gives each range
+            window equal weight in the two-term fit — so a handful of junk
+            near-range pixels can dominate it and force beta_D(z) to decay when
+            it should rise. Set to 0 to disable.
         """
         self.depth_dir = Path(workspace) / "stereo" / "depth_maps"
         self.kind = kind
         self.clip_percentile = clip_percentile
+        self.clip_low_percentile = clip_low_percentile
 
     def _find(self, image_name):
         """@brief Locate the COLMAP depth-map file for one image.
@@ -83,13 +93,20 @@ class ColmapDepthSource(DepthSource):
 
         H, W = img.shape[:2]
         if depth.shape != (H, W):
-            depth = np.asarray(
+            # np.array (not asarray): PIL's buffer is read-only, and the
+            # normalisation below writes in place, so force a writable copy.
+            depth = np.array(
                 Image.fromarray(depth).resize((W, H), Image.NEAREST),
                 dtype=np.float32)
+        else:
+            depth = np.ascontiguousarray(depth, dtype=np.float32)
 
         depth[~np.isfinite(depth)] = 0.0
         depth[depth <= 0] = 0.0
         if self.clip_percentile and np.any(depth > 0):
             hi = np.percentile(depth[depth > 0], self.clip_percentile)
             depth[depth > hi] = 0.0
+        if self.clip_low_percentile and np.any(depth > 0):
+            lo = np.percentile(depth[depth > 0], self.clip_low_percentile)
+            depth[(depth > 0) & (depth < lo)] = 0.0
         return depth

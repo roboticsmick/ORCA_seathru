@@ -14,5 +14,12 @@ seathru_out*/
 *_debug.png
 survey_stats.json
 
+# Local COLMAP build + dataset working copies (not part of the library)
+/colmap/
+/2024_02_PALFREY*/
+
+# Development testing files
+/dev/
+
 .DS_Store
 Thumbs.db

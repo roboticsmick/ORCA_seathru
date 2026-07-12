@@ -39,12 +39,30 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from seathru.core import SeathruParams, run_seathru          # noqa: E402
-from seathru.depth import EstimatedDepthSource, PlaneDepthSource  # noqa: E402
+from seathru.depth import (ColmapDepthSource, EstimatedDepthSource,  # noqa: E402
+                           PlaneDepthSource)
 from seathru.depth.base import ImageMeta                     # noqa: E402
 from seathru.io_images import _linear_to_srgb, load_image    # noqa: E402
 from seathru.metadata import load_metadata                   # noqa: E402
 
-SCALAR_PARAMS = ("f", "l", "p", "epsilon")
+# Sweepable scalars. stretch_low/stretch_high map into the stretch_pct tuple;
+# the rest are direct SeathruParams fields.
+SCALAR_PARAMS = ("f", "l", "p", "epsilon", "stretch_low", "stretch_high")
+
+
+def apply_params(base, updates):
+    """Return a SeathruParams copy with `updates` applied, handling the
+    stretch_low/stretch_high tuple members specially."""
+    stretch = list(base.stretch_pct)
+    direct = {}
+    for name, val in updates.items():
+        if name == "stretch_low":
+            stretch[0] = val
+        elif name == "stretch_high":
+            stretch[1] = val
+        else:
+            direct[name] = val
+    return replace(base, stretch_pct=tuple(stretch), **direct)
 COL_HDR_H = 24
 ROW_HDR_W = 74
 TITLE_H = 58
@@ -82,7 +100,12 @@ def main(argv=None):
     ap.add_argument("--y-param", choices=SCALAR_PARAMS, default="l")
     ap.add_argument("--x-values", default="1.5,2.0,2.5,3.0")
     ap.add_argument("--y-values", default="0.5,1.0,1.5")
-    ap.add_argument("--depth", choices=["estimated", "plane"], default="estimated")
+    ap.add_argument("--depth", choices=["estimated", "plane", "colmap"], default="estimated")
+    ap.add_argument("--colmap-workspace", default=None,
+                    help="COLMAP dense workspace (metric depth). Use --input-dir "
+                         "<workspace>/images so image names match the depth maps.")
+    ap.add_argument("--colmap-depth-kind", choices=["geometric", "photometric"],
+                    default="geometric")
     ap.add_argument("--max-size", type=int, default=800)
     ap.add_argument("--thumb-width", type=int, default=360)
     ap.add_argument("--plane-default", type=float, default=5.0)
@@ -97,7 +120,12 @@ def main(argv=None):
     meta = meta_map.get(args.image, ImageMeta(image_name=args.image))
 
     img_lin, _ = load_image(input_dir / args.image, max_size=args.max_size)
-    if args.depth == "estimated":
+    if args.depth == "colmap":
+        if not args.colmap_workspace:
+            raise SystemExit("--depth colmap needs --colmap-workspace")
+        source = ColmapDepthSource(args.colmap_workspace, kind=args.colmap_depth_kind)
+        depth_note = f"depth = COLMAP {args.colmap_depth_kind} (metric, all params active)"
+    elif args.depth == "estimated":
         source = EstimatedDepthSource()
         depth_note = "depth = image-derived prior (all params active)"
     else:
@@ -115,7 +143,7 @@ def main(argv=None):
     tiles = {}  # (yi, xi) -> uint8 thumbnail
     for yi, yv in enumerate(ys):
         for xi, xv in enumerate(xs):
-            params = replace(base, **{args.x_param: xv, args.y_param: yv})
+            params = apply_params(base, {args.x_param: xv, args.y_param: yv})
             rec = run_seathru(img_lin, depths, params).recovered
             tiles[(yi, xi)] = thumb(to_srgb_uint8(rec), w)
     cell_h = max(t.height for t in tiles.values())

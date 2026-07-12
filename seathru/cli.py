@@ -54,7 +54,8 @@ def build_depth_source(args):
         return FileDepthSource(args.depth_dir, scale=args.depth_scale)
     if args.depth == "colmap":
         from .depth import ColmapDepthSource
-        return ColmapDepthSource(args.colmap_workspace)
+        return ColmapDepthSource(args.colmap_workspace, kind=args.colmap_depth_kind,
+                                 clip_low_percentile=args.colmap_clip_low)
     if args.depth == "mono":
         from .depth import MonocularDepthSource
         rng = (args.mono_near, args.mono_far) if args.mono_near else None
@@ -85,6 +86,13 @@ def main(argv=None):
     depth_group.add_argument("--depth-dir", default=None, help="Directory of SfM range maps (--depth file)")
     depth_group.add_argument("--depth-scale", type=float, default=1.0, help="Multiply loaded maps into metres")
     depth_group.add_argument("--colmap-workspace", default=None, help="COLMAP dense workspace with stereo/depth_maps (--depth colmap)")
+    depth_group.add_argument("--colmap-depth-kind", choices=["geometric", "photometric"], default="geometric",
+                             help="Which patch_match_stereo map to read (--depth colmap). 'photometric' is a "
+                                  "single-pass map ~2x faster to compute; 'geometric' is multi-view consistent")
+    depth_group.add_argument("--colmap-clip-low", type=float, default=2.0,
+                             help="Drop depths below this percentile (--depth colmap). MVS emits spurious "
+                                  "near-camera points; because beta = -ln(illuminant)/z, a tiny z explodes "
+                                  "beta and corrupts the attenuation fit. 0 disables")
     depth_group.add_argument("--mono-backend", choices=["midas", "depth_anything_v2"], default="midas")
     depth_group.add_argument("--mono-near", type=float, default=None)
     depth_group.add_argument("--mono-far", type=float, default=None)
@@ -105,6 +113,12 @@ def main(argv=None):
                             help="Curve-fit random restarts for backscatter (Eq. 10); lower = faster, less robust")
     algo_group.add_argument("--attenuation-restarts", type=int, default=10,
                             help="Curve-fit random restarts for attenuation (Eq. 11); lower = faster, less robust")
+    algo_group.add_argument("--attenuation-mode", choices=["two-term", "coarse"], default="two-term",
+                            help="beta_D estimation. 'two-term' = the paper's Eq. 11 decaying fit (correct for "
+                                 "HORIZONTAL imaging). 'coarse' = use the illuminant-derived beta_D (Eq. 12) "
+                                 "directly; REQUIRED for DOWNWARD-looking surveys with depth relief (e.g. a reef "
+                                 "dropoff), where range ~= depth so beta_D RISES with range and the decaying "
+                                 "two-term form cannot represent it, leaving deep water uncorrected")
 
     survey_group = p.add_argument_group("survey-locked mode (see README)")
     survey_group.add_argument("--survey-locked", action="store_true",
@@ -131,6 +145,7 @@ def main(argv=None):
         stretch_pct=(args.stretch_low, args.stretch_high),
         backscatter_restarts=args.backscatter_restarts,
         attenuation_restarts=args.attenuation_restarts,
+        attenuation_mode=args.attenuation_mode,
         return_debug=args.debug,
     )
     depth_source = build_depth_source(args)
