@@ -145,6 +145,13 @@ python -m seathru.cli --input-dir my_survey/images --out-dir my_survey/seathru_o
     --depth colmap --colmap-workspace my_survey/colmap/dense --full-res
 ```
 
+> **Downward-looking surveys (reef/seabed mapping): add
+> `--attenuation-mode coarse`.** See
+> [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping) —
+> the paper's default attenuation fit leaves deep water uncorrected on
+> straight-down imagery, and `coarse` is the fix. The full recommended command
+> for a reef survey is at the end of that section.
+
 Monocular neural depth (needs torch, see [Install](#install)):
 
 ```bash
@@ -231,6 +238,80 @@ Notes:
   `seathru.core.SurveyStats`, and `SeathruParams(locked_stats=stats)` applies
   it to any `run_seathru(...)` call.
 
+## Downward-looking surveys (reef/seabed mapping)
+
+Sea-thru's image formation model (paper Eq. 2) is derived for **horizontal**
+imaging and, as the paper states, "applied to other directions assuming the
+deviations are small." For a **downward-looking** survey — an ASV/drone
+mapping the seabed straight down — that assumption breaks, and the default
+pipeline leaves the **deep parts of the scene full of water** (a reef dropoff
+corrects beautifully in the shallows and stays blue/cyan at depth). Three
+settings fix it; all are validated on a real 20×20 m reef survey spanning
+1.5–5.6 m depth.
+
+**1. `--attenuation-mode coarse` — the important one.** In horizontal imaging
+every object is at roughly the same depth, so the ambient light is constant and
+the direct-signal attenuation `β_D` genuinely *decays* with range. That is why
+Eq. 11 fits `β_D(z)` as a sum of **decaying** exponentials (both exponents
+constrained ≤ 0). Looking straight down, **range ≈ depth**, so deeper pixels sit
+under markedly redder-depleted light and the true `β_D` *rises* with range. The
+decaying two-term form cannot represent a rising function, so `refine_attenuation`
+flattens the correction exactly where the water column is thickest — the optical
+depth `β_D·z` comes out *decreasing* with range, which is physically impossible.
+`--attenuation-mode coarse` skips that fit and uses the illuminant-derived
+`β_D = −ln(illuminant)/z` (Eq. 12) directly, which correctly rises with range.
+On the test reef this moved the deep-vs-shallow red/blue consistency from
+**0.23 (deep still full of water) to ~0.9 (deep as corrected as shallow)**.
+
+**2. `--colmap-clip-low 2.0` (on by default for `--depth colmap`).** MVS emits a
+few spurious near-camera points (e.g. 0.2 m on a reef imaged from 3 m). Because
+`β = −ln(illuminant)/z`, a tiny `z` explodes `β`, and those handful of junk
+pixels get outsized weight in the attenuation fit — enough on their own to drag
+even the coarse estimate the wrong way. Dropping the lowest ~2% of depths per
+image removes them.
+
+**3. Survey-locked: use `--no-lock-backscatter`.** Backscatter
+`B = veiling·(1 − e^{−β_bs·z})` is *intrinsically range-dependent*. Freezing one
+median backscatter across a survey (the default `--survey-locked`) under-subtracts
+veiling light on the deep frames and re-introduces the blue haze — on the test
+set it regressed deep frames from ~0.8 back to ~0.3. White-balance gains, by
+contrast, are safe (and useful) to lock for cross-view colour consistency. So on
+a depth-varying survey, **lock white-balance and exposure but keep backscatter
+per-image**: pass `--survey-locked --lock-exposure --no-lock-backscatter`.
+
+Also relevant on real MVS depth: **`--colmap-fill-holes`** (default on) fills
+small invalid speckle in the depth map with the nearest valid depth, so isolated
+no-depth pixels don't survive as untreated raw-colour specks. Large genuine gaps
+(and the undistortion border) are left alone; in a survey with good overlap they
+are covered by neighbouring frames downstream anyway.
+
+**Recommended command for a downward reef/seabed survey:**
+
+```bash
+python -m seathru.cli \
+    --input-dir my_survey/colmap/dense/images \
+    --out-dir   my_survey/seathru_out \
+    --csv       my_survey/processed_images.csv \
+    --depth colmap --colmap-workspace my_survey/colmap/dense \
+    --colmap-depth-kind photometric \
+    --attenuation-mode coarse \
+    --l 1.0 --full-res \
+    --survey-locked --lock-exposure --no-lock-backscatter --calib-sample-size 20
+```
+
+> **`l` on a reef survey:** with `coarse` mode the paper default `--l 1.0` is
+> right. Do **not** reflexively lower `l` to fix over-brightness on shallow
+> frames — it starves the deep correction; and raising it past ~1.15 tips the
+> deep pixels into a pink/red over-correction. Tune it with the QC harness
+> ([tuning tools](#tuning-tools)) on depth-spanning frames, not a single shallow
+> one.
+>
+> **Physical limit:** where the raw red channel is already at the sensor noise
+> floor (very deep, turbid, or strongly red-absorbing water), no method can
+> recover colour — there is no signal to amplify. `scripts/seathru_qc_variants.py`
+> reports the fraction of a survey that is in this regime so you know what to
+> expect before a full run.
+
 ## Configuration / tunable parameters
 
 All tunable knobs live in one place: `seathru.core.SeathruParams` (mirrored
@@ -241,7 +322,8 @@ All tunable knobs live in one place: `seathru.core.SeathruParams` (mirrored
 | --- | --- | --- | --- |
 | `p` | `--p` | `0.5` | Illuminant locality (Eq. 14 support weight, 0–1). Higher trusts the local pixel over its neighbourhood average. |
 | `f` | `--f` | `2.0` | Illuminant geometry factor (paper uses 2). Raises overall brightness. |
-| `l` | `--l` | `1.0` | Attenuation/brightness balance — **the main strength dial**. Lower if far/deep areas over-brighten. |
+| `l` | `--l` | `1.0` | Attenuation/brightness balance — **the main strength dial**. Lower if far/deep areas over-brighten — **but not on a downward survey**, where lowering it starves the deep correction (see [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping)). |
+| `attenuation_mode` | `--attenuation-mode` | `two-term` | `two-term` = paper Eq. 11 decaying fit (horizontal imaging). `coarse` = illuminant-derived `β_D` (Eq. 12); **required for downward-looking surveys**. |
 | `epsilon` | `--epsilon` | `0.05` | Iso-range neighbourhood band width (Eq. 15), fraction of the scene's depth span. |
 | `protect_red` | `--no-protect-red` to disable | `True` | White-balance red gently instead of pure Gray-World (avoids pink cast on red-starved deep frames). |
 | `stretch_pct` | `--stretch-low` / `--stretch-high` | `(0.5, 99.5)` | Output contrast-stretch percentiles. Widen toward `(0.1, 99.9)` for a flatter, safer result; tighten for more punch. |
@@ -390,7 +472,7 @@ metric on a synthetic scene).
 | Iso-range neighbourhoods | Eq. 15 | `construct_neighborhood_map` |
 | Local-space-average-colour illuminant | Eq. 13–14 | `estimate_illumination` |
 | Coarse `β_D = −log(illuminant)/z` | Eq. 12 | `coarse_attenuation` |
-| Two-term-exponential `β_D(z)` refined to range map | Eq. 11, 16–17 | `refine_attenuation` |
+| Two-term-exponential `β_D(z)` refined to range map | Eq. 11, 16–17 | `refine_attenuation` (`mode="two-term"`; `mode="coarse"` skips it for downward surveys) |
 | Recover `J = (I−B)·e^{β_D·z}` + white balance | Eq. 8–9 | `recover_image` |
 
 ## Deviations from the paper (documented)
@@ -406,6 +488,14 @@ metric on a synthetic scene).
   addition for processing large, consistently-lit photo surveys where
   per-image adaptivity is a liability rather than a feature. It's opt-in
   (`--survey-locked`); the default behaviour matches the paper.
+- **`--attenuation-mode coarse`** (see [Downward-looking
+  surveys](#downward-looking-surveys-reefseabed-mapping)) replaces the Eq. 11
+  two-term fit with the Eq. 12 coarse `β_D` for straight-down imaging, where the
+  paper's horizontal-imaging assumption makes the decaying two-term form fit the
+  wrong sign of range dependence. Opt-in; the default (`two-term`) matches the
+  paper. `--no-lock-backscatter` and the `--depth colmap` MVS-depth hygiene
+  flags (`--colmap-clip-low`, `--colmap-fill-holes`) are also additions for
+  real SfM depth, not part of the paper.
 
 ## Citing
 

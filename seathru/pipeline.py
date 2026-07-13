@@ -70,7 +70,7 @@ def process_folder(input_dir, out_dir, depth_source: DepthSource,
                    csv_path=None, params: SeathruParams | None = None,
                    max_size=1024, debug=False, full_res=False, on_progress=print,
                    survey_locked=False, calib_sample_size=12, calib_seed=0,
-                   lock_exposure=False, stats_path=None):
+                   lock_exposure=False, lock_backscatter=True, stats_path=None):
     """
     @brief Process every image in ``input_dir``; write recovered images to
     ``out_dir``. This is the function ``seathru.cli`` drives.
@@ -98,6 +98,15 @@ def process_folder(input_dir, out_dir, depth_source: DepthSource,
     @param lock_exposure Also freeze the output contrast-stretch bounds from
         calibration; otherwise each frame keeps its own exposure normalisation
         even in survey-locked mode.
+    @param lock_backscatter Keep the frozen per-survey backscatter (default).
+        Set False to re-estimate backscatter per image while still locking
+        white-balance (and, if requested, exposure). Backscatter
+        ``B = veiling * (1 - exp(-beta_bs * z))`` is intrinsically
+        range-dependent, so on surveys with large depth relief (e.g. a reef
+        dropoff) a single frozen backscatter under-subtracts veiling light at
+        depth and leaves the deep water uncorrected; per-image backscatter with
+        locked white-balance keeps cross-view colour consistency without that
+        failure.
     @param stats_path Path to save/load the locked-stats JSON. Defaults to
         ``<out_dir>/survey_stats.json``. If the file already exists it is
         loaded (not recalibrated) - delete it to force a fresh calibration.
@@ -132,6 +141,8 @@ def process_folder(input_dir, out_dir, depth_source: DepthSource,
             on_progress(f"Saved locked stats -> {resolved_stats_path}")
         if not lock_exposure:
             stats = replace(stats, stretch_bounds=None)
+        if not lock_backscatter:
+            stats = replace(stats, backscatter_coefs=None)
         params = replace(params, locked_stats=stats)
 
     results = []

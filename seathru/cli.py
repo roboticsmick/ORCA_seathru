@@ -55,7 +55,9 @@ def build_depth_source(args):
     if args.depth == "colmap":
         from .depth import ColmapDepthSource
         return ColmapDepthSource(args.colmap_workspace, kind=args.colmap_depth_kind,
-                                 clip_low_percentile=args.colmap_clip_low)
+                                 clip_low_percentile=args.colmap_clip_low,
+                                 fill_holes_max_frac=args.colmap_fill_holes,
+                                 fill_border=args.colmap_fill_border)
     if args.depth == "mono":
         from .depth import MonocularDepthSource
         rng = (args.mono_near, args.mono_far) if args.mono_near else None
@@ -93,6 +95,15 @@ def main(argv=None):
                              help="Drop depths below this percentile (--depth colmap). MVS emits spurious "
                                   "near-camera points; because beta = -ln(illuminant)/z, a tiny z explodes "
                                   "beta and corrupts the attenuation fit. 0 disables")
+    depth_group.add_argument("--colmap-fill-holes", type=float, default=0.02,
+                             help="Fill INTERIOR invalid depth holes smaller than this fraction of image area "
+                                  "with the nearest valid depth (--depth colmap) - bounded interpolation, so "
+                                  "MVS speckle and occluder holes (fish) don't survive as untreated raw-colour "
+                                  "patches mid-frame. 0 disables")
+    depth_group.add_argument("--colmap-fill-border", action="store_true",
+                             help="Also fill border-touching invalid depth regions by nearest-valid "
+                                  "extrapolation (--depth colmap). Off by default: edge gaps are covered by "
+                                  "overlapping frames in multi-view products; enable for clean standalone frames")
     depth_group.add_argument("--mono-backend", choices=["midas", "depth_anything_v2"], default="midas")
     depth_group.add_argument("--mono-near", type=float, default=None)
     depth_group.add_argument("--mono-far", type=float, default=None)
@@ -132,6 +143,12 @@ def main(argv=None):
     survey_group.add_argument("--lock-exposure", action="store_true",
                               help="Also freeze the output contrast-stretch bounds; by default exposure "
                                    "still adapts per image even in --survey-locked mode")
+    survey_group.add_argument("--no-lock-backscatter", dest="lock_backscatter",
+                              action="store_false",
+                              help="In --survey-locked mode, re-estimate backscatter per image while still "
+                                   "locking white-balance/exposure. Backscatter is range-dependent, so on "
+                                   "surveys with large depth relief (reef dropoffs) a frozen backscatter "
+                                   "under-corrects the deep frames. Recommended for downward surveys")
     survey_group.add_argument("--stats-file", default=None,
                               help="Path to save/load the locked-stats JSON "
                                    "(default: <out-dir>/survey_stats.json). If it already exists it is "
