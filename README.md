@@ -33,15 +33,19 @@ attenuation).
 ## Contents
 
 - [Why a range map matters](#why-a-range-map-matters)
+- [The method, end to end](#the-method-end-to-end)
+- [Novel contributions vs the original Sea-thru](#novel-contributions-vs-the-original-sea-thru)
 - [Install](#install)
 - [Pipeline: correcting a dataset](#pipeline-correcting-a-dataset)
 - [Survey-locked mode](#survey-locked-mode)
+- [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping)
 - [Configuration / tunable parameters](#configuration--tunable-parameters)
 - [Time estimates](#time-estimates)
 - [Large datasets (10k+ images) → COLMAP](#large-datasets-10k-images--colmap-on-a-laptop)
 - [Tuning tools](#tuning-tools)
 - [How it maps to the paper](#how-it-maps-to-the-paper)
 - [Deviations from the paper](#deviations-from-the-paper-documented)
+- [Limitations](#limitations)
 - [Citing](#citing)
 
 ## Why a range map matters
@@ -62,6 +66,166 @@ backscatter removal + white balance only (the `f`/`l`/`p`/`epsilon` knobs have
 **no effect**). Use SfM, monocular, or the image-derived prior for the full
 range-varying colour recovery.
 
+## The method, end to end
+
+The complete processing chain, with each stage's origin marked —
+**[paper]** = as published in Sea-thru (Akkaynak & Treibitz 2019),
+**[mod]** = the paper's stage with a documented modification,
+**[new]** = an addition of this library (see
+[Novel contributions](#novel-contributions-vs-the-original-sea-thru)):
+
+```text
+RGB image (sRGB JPEG → inverse-gamma to ~linear)      [mod: paper uses linear RAW]
+        │
+        │      COLMAP dense depth  <name>.geometric/photometric.bin  (metres)
+        │              │
+        │              ├─ high-percentile clip (far MVS outliers)          [new]
+        │              ├─ low-percentile clip (near-camera MVS junk)       [new]
+        │              ├─ erosion trust filter (noise blobs in failed zones)[new]
+        │              ├─ monocular patch: MiDaS + per-image affine
+        │              │  alignment to the frame's own valid pixels        [new]
+        │              └─ nearest-valid fill: interior always, border opt-in[new]
+        ▼              ▼
+  backscatter  B_c(z) = B∞(1−e^{−β_B z}) + residual   (Eq. 10, dark-pixel fit)
+        │      per-frame by default; NOT locked across a survey            [paper+new]
+        ▼
+  iso-range neighbourhoods (Eq. 15)                                        [paper]
+        ▼
+  illuminant E_c:
+     local space-average colour (Eq. 14)                                   [paper]
+     ── or ──  water-column model  E_c(z) = e^{a_c + b_c z}                [new]
+               b_c locked per survey, a_c fitted per frame                 [new]
+        ▼
+  attenuation β_D(z):
+     two-term decaying exponential fit (Eq. 11)                            [paper]
+     ── or ──  coarse form  β_D = −ln(E_c)/z  (Eq. 12) used directly       [mod]
+        ▼
+  recovery  J = (I − B) · e^{β_D z}   (Eq. 8)                              [paper]
+        ▼
+  white balance (Eq. 9; gains locked per survey)                           [paper+new]
+        ▼
+  robust contrast stretch (percentiles; bounds locked per survey)          [new]
+        ▼
+  saturation (uniform chroma gain; cosmetic, off by default)               [new]
+        ▼
+  sRGB PNG out  +  per-frame processing-path notes → end-of-run audit      [new]
+```
+
+Two operating regimes select between the `or` branches:
+
+- **Horizontal/oblique imaging** (diver transects, forward-looking ROV — the
+  paper's setting): use the paper defaults — local illuminant, two-term
+  Eq. 11 fit, per-image adaptive statistics. This library reproduces the
+  published method.
+- **Downward (nadir) survey imaging** (ASV/drone seabed mapping): use
+  `--attenuation-mode coarse --illuminant-mode water-column` plus
+  survey-locked statistics — the configuration this library was built to get
+  right, motivated and validated in
+  [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping).
+
+## Novel contributions vs the original Sea-thru
+
+Everything in this section is an addition or correction relative to both the
+2019 paper and the reference implementations of it, stated with the failure
+that motivated it and the evidence behind it. All validation numbers come from
+a 2,022-image ASV reef survey (GoPro, 1.5–5.6 m depth, COLMAP metric depth);
+the depth-consistency metric is the recovered red/blue ratio of each frame's
+deepest 15% of pixels versus its shallowest 25% (1.0 = the deep zone is as
+water-free as the shallow zone), measured only where the raw red channel
+carries signal above the sensor noise floor.
+
+**1. Nadir-imaging failure analysis of the Eq. 11 attenuation fit, and the
+`coarse` correction.** Eq. 2 of the paper is derived for horizontal imaging
+and "applied to other directions assuming the deviations are small." For a
+downward camera the deviation is not small: range ≈ depth, so deeper pixels
+are lit by strongly red-depleted ambient light and the effective wideband
+`β_D` **rises** with range — while Eq. 11 constrains `β_D(z)` to a sum of
+*decaying* exponentials. The fit therefore produces an optical depth
+`β_D(z)·z` that *decreases* with range (physically impossible — it claims
+less total attenuation through more water), silently flattening the
+correction exactly where the water column is thickest. Using the paper's own
+Eq. 12 coarse estimate directly restores the correct monotonicity.
+*Evidence:* depth-consistency 0.23 → 0.79 (→ ≈1.0 with the remaining
+contributions); the "current vs coarse" gallery figures.
+
+**2. A water-column illuminant model for nadir surveys.** The paper's
+illuminant (Eq. 14, local space-average colour) embeds a *local gray-world*
+assumption. Where the seabed is genuinely coloured (green algae rubble in
+deep zones), the correction paints the zone with the complementary cast, and
+because the correction is exponential in range the cast **grows with depth**
+— measured as a red/green drift of **+0.11 /m** (deep yellow corals render
+red). Modelling the illuminant instead as a per-channel exponential in range,
+`E_c(z) = exp(a_c + b_c z)` (fit on binned medians, noise-floor pixels
+excluded, extrapolated over the full valid range), makes the correction a
+function of the *water column* rather than of local scene colour: two objects
+at the same range receive identical treatment and relative colour is
+preserved; natural shading survives. *Evidence:* R/G drift +0.11 → ≈0.0 /m;
+best colour separation of all variants in the blind side-by-side review.
+
+**3. Mixed-effects survey calibration (survey-locked mode).** For
+orthomosaic/3DGS use, per-frame adaptive fitting is a liability: frame-to-
+frame drift becomes seams and view-dependent colour flicker. This library
+freezes the survey-wide statistics — white-balance gains, exposure-stretch
+bounds, and the water-column **slope** `b_c` — from a calibration sample,
+while deliberately keeping two things per-frame: the **backscatter** fit
+(backscatter is intrinsically range-dependent; locking it re-introduced haze
+on deep frames, 0.8 → 0.3) and the illuminant **intercept** `a_c` (a property
+of the frame's auto-exposure/auto-white-balance; locking it passed camera
+AWB drift into the output as whole-frame casts). The slope is pooled with a
+*within-frame* (fixed-effects) estimator so between-frame exposure
+differences cannot masquerade as depth attenuation. This split also removes a
+silent failure mode: frames too flat to fit their own exponential previously
+fell back to the local illuminant, producing abrupt washed-out ↔ saturated
+flips between neighbouring frames. *Evidence:* neighbouring-frame chroma
+difference at the flip boundary 0.02 → 0.008; QC 0/7 problem frames across
+the survey's full depth range.
+
+**4. MVS-depth hygiene for real dense-stereo output.** Sea-thru assumes a
+clean range map; real `patch_match_stereo` output is not clean, and each
+defect couples into the physics through `β = −ln(E)/z`:
+
+- *Near-range junk* (spurious 0.2 m points on a 3 m reef) explodes `β` and,
+  because the fit thins samples per range window, a handful of junk pixels
+  can dominate it → low-percentile clip (`--colmap-clip-low`).
+- *Noise blobs inside failed zones* (motion blur, texture-poor patches)
+  survive global percentile clipping and are attached to the valid region
+  by thin bridges, so a nearest-valid hole fill propagates garbage — one
+  motion-blurred band was assigned 3.8–7.2 m against a 2.5 m rim,
+  producing a saturated false-red band → erosion trust filter (erode the
+  valid mask to cut bridges; trust only pixels near large surviving cores).
+- *Large holes* are not rim continuations, so any propagation fill guesses
+  wrong → **monocular patching** (`--colmap-fill-mono`): a monocular
+  network's relative depth is aligned to the frame's own ~90% valid metric
+  pixels by a robust per-image affine fit in inverse depth — the survey
+  supervises itself, no training required. Median alignment residual on
+  the failure frame: **0.10 m**; artefact eliminated.
+- *Interior vs border* holes get different semantics (bounded
+  interpolation always; extrapolation opt-in via `--colmap-fill-border`).
+
+**5. A QC methodology for survey-scale correction.** Three cheap instruments
+that catch failures before a multi-hour run: the **depth-consistency metric**
+(above); a **recoverability scan** reporting the fraction of deep pixels
+whose raw red sits below the sensor noise floor (no method can recover what
+was never recorded — 8% of frames on the test survey are partially in this
+regime, and knowing that beforehand prevents chasing unfixable frames); and a
+**processing-path audit** — every frame logs which code path each component
+took, with an end-of-run summary, so silent fallbacks are visible instead of
+manifesting as unexplained odd-looking frames. `scripts/seathru_qc_variants.py`
+packages the sample-first workflow (depth-spanning frame selection, named
+variants, per-frame metrics).
+
+**6. Cosmetic, declared as such:** a uniform post-recovery chroma gain
+(`--saturation`) compensating the flatter look of physically-correct
+attenuation removal (measured chroma 0.23 → 0.13 when the deep-water fix went
+in). It is outside the physical model, applied identically to every frame,
+and off by default.
+
+Contributions 1–4 change *what is computed*; 5–6 change *how you operate it*.
+For a journal write-up, the natural baseline comparisons are: stock Sea-thru
+(paper defaults), + contribution 1, + 2, + 3, each scored with the metric of
+contribution 5 on the same survey — the intermediate numbers above are exactly
+that ablation.
+
 ## Install
 
 Tested on Linux (Ubuntu) and Windows, Python 3.9–3.13 (monocular depth needs
@@ -79,9 +243,12 @@ pip install --upgrade pip
 pip install -e .                    # core pipeline (numpy/scipy/scikit-image/pillow)
 pip install -e ".[debug]"           # + matplotlib, for --debug intermediate-map montages
 
-# Optional: monocular depth (--depth mono). Needs a Python <=3.12 venv,
-# torch has no wheels for newer interpreters yet:
-pip install torch torchvision
+# Optional: monocular depth (--depth mono) AND monocular hole patching for
+# COLMAP depth (--colmap-fill-mono, recommended for surveys). Needs a Python
+# <=3.12 venv; use the CUDA index for GPU inference (~0.5 s/frame vs several
+# s/frame on CPU). MiDaS additionally needs timm + OpenCV:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install timm opencv-python-headless
 ```
 
 Confirm it's installed:
@@ -279,13 +446,75 @@ contrast, are safe (and useful) to lock for cross-view colour consistency. So on
 a depth-varying survey, **lock white-balance and exposure but keep backscatter
 per-image**: pass `--survey-locked --lock-exposure --no-lock-backscatter`.
 
-Also relevant on real MVS depth: **`--colmap-fill-holes`** (default on) fills
-small invalid speckle in the depth map with the nearest valid depth, so isolated
-no-depth pixels don't survive as untreated raw-colour specks. Large genuine gaps
-(and the undistortion border) are left alone; in a survey with good overlap they
-are covered by neighbouring frames downstream anyway.
+**4. `--illuminant-mode water-column` — best colour fidelity at depth.** The
+paper's illuminant (Eq. 14) is a *local space-average colour*: it normalises
+local shading, but embeds a local gray-world assumption. Where the seabed is
+genuinely coloured (green algae rubble in a deep zone), that assumption paints
+the whole zone with the complementary cast — and because the correction is
+exponential in range, the cast grows with depth: yellow/orange objects visibly
+redden the deeper they sit. `water-column` mode instead fits the illuminant as
+a per-channel exponential in range, `E_c(z) = exp(a_c + b_c z)` — robustly
+(binned medians, sensor-noise-floor pixels excluded) and extrapolated over the
+full valid range so the deepest pixels keep getting the full correction.
+Objects at the same range then receive **identical** correction, so their
+relative colours are preserved, and natural shading survives in the output.
+On the test reef this gave the best colour separation of every variant tried
+(see the gallery below).
 
-**Recommended command for a downward reef/seabed survey:**
+With `--survey-locked`, the water-column **slope** `b_c` is calibrated once
+from the whole survey (pooled *within-frame* estimator, so auto-exposure
+differences between frames can't masquerade as depth attenuation) and reused
+for every frame, while the **intercept** `a_c` stays per-frame. That split
+matters: the slope is a property of the water — identical everywhere in the
+survey — so flat frames without enough depth relief to fit their own
+exponential no longer silently fall back to the local illuminant (which showed
+up as an abrupt washed-out ↔ saturated flip between neighbouring frames); and
+the intercept is a property of the frame (auto-exposure / auto-white-balance
+drift), so locking *it* would pass camera AWB drift straight into the output
+as whole-frame colour casts. Validated: 0/7 problem frames on the QC set
+including the deepest frame, the flattest run, and a dropoff-tail frame that
+per-frame fitting under-corrected.
+
+**5. Depth-map hygiene: hole filling** (`--depth colmap`). MVS leaves invalid
+holes — speckle, moving fish, texture-poor patches — and a pixel without depth
+gets **no correction at all**, surviving as a raw hazy patch in an otherwise
+corrected frame. `--colmap-fill-holes` (default on, up to 2% of image area)
+fills *interior* holes with the nearest valid depth — bounded interpolation,
+enclosed by real measurements. Border-touching gaps (the undistortion frame,
+edge strips where the first/last frames lack a matching neighbour) are
+*extrapolation* and opt-in via **`--colmap-fill-border`**: enable it when every
+pixel of every frame should be corrected (feeding photogrammetry / 3DGS
+texturing); leave it off if you prefer honest invalid edges that overlapping
+frames cover downstream.
+
+Two hardening layers make the filling trustworthy on real MVS output:
+
+- **Erosion trust filter** (on by default). A zone where MVS failed is rarely
+  100% invalid — it contains blobs of "valid" pure-noise depth attached to the
+  real region by thin bridges, and a nearest-valid fill will happily propagate
+  that garbage (observed: a motion-blurred band assigned 3.8–7.2 m against a
+  2.5 m rim → a strong false red band). Before filling, the valid mask is
+  eroded to cut the bridges, only large surviving cores are trusted, and
+  untrusted "valid" pixels are discarded.
+- **`--colmap-fill-mono` — monocular neural patching (recommended; needs
+  torch).** For *large* holes the true surface is often not a continuation of
+  the rim at all, so any propagation-based fill guesses wrong. This runs a
+  monocular depth network (MiDaS by default) on the frame and aligns its
+  relative output to the ~90%+ of valid metric COLMAP pixels with a per-image
+  robust affine fit in inverse depth — no training needed; the survey's own
+  depth is the supervision. On the red-band test frame the aligned mono patch
+  matched the COLMAP overlap to **0.10 m** median error and fully removed the
+  artefact. Costs ~0.5 s/frame on a modest GPU after model load.
+
+**6. `--saturation` — colour punch.** Physically-correct attenuation removal
+tends to look flatter than the eye expects: measured chroma dropped from ~0.23
+to ~0.13 on the test reef when the deep-water fix went in ("the reds aren't as
+red, the yellows aren't as yellow"). A post-recovery chroma gain of **1.4–1.6**
+restores it without touching the water model; it is applied uniformly, so
+survey-wide colour consistency is preserved.
+
+**Recommended command for a downward reef/seabed survey** (the full validated
+recipe):
 
 ```bash
 python -m seathru.cli \
@@ -294,10 +523,83 @@ python -m seathru.cli \
     --csv       my_survey/processed_images.csv \
     --depth colmap --colmap-workspace my_survey/colmap/dense \
     --colmap-depth-kind photometric \
-    --attenuation-mode coarse \
-    --l 1.0 --full-res \
+    --colmap-clip-low 2.0 --colmap-fill-holes 0.02 --colmap-fill-border \
+    --colmap-fill-mono \
+    --attenuation-mode coarse --illuminant-mode water-column \
+    --l 1.0 --saturation 1.6 --full-res \
     --survey-locked --lock-exposure --no-lock-backscatter --calib-sample-size 20
 ```
+
+Every run prints a per-frame note of which processing path each component took
+(`illum: wc-locked-slope`, `mono-filled 13.1%`, fallbacks, …) and ends with a
+**processing-path summary** — a count of frames per path. Read it before
+trusting the output: an unexpected fallback entry there is the first clue when
+a handful of frames come out looking different from their neighbours.
+
+### Validation gallery (2022-image reef survey, 1.5–5.6 m depth)
+
+How the corrections were arrived at, shown on real frames. Each improvement
+was validated on depth-spanning sample frames *before* committing to full
+survey runs (`scripts/seathru_qc_variants.py` automates exactly this
+workflow — use it).
+
+**Why hole filling matters** — pixels without depth are left at their raw
+colour. Left→right: raw frame; COLMAP depth (89.5% valid); valid/invalid mask;
+recovered frame with **magenta marking still-blue pixels (14.9%)** — the
+uncorrected patches track the missing depth almost exactly:
+
+![no-depth pixels stay blue](docs/images/bluecheck_G0018489.png)
+
+**Fill levels compared** — default small-speckle fill, interior fill, and full
+border extrapolation (`--colmap-fill-border`, right: 100% valid, every pixel
+corrected — note the top-edge strip present in the middle tiles is gone):
+
+![fill levels](docs/images/filllevels_G0018489.png)
+
+**Illuminant mode on a deep frame with healthy red signal** (6.3 m, ~6% of
+deep pixels at the noise floor). Water-column mode (third column) clears the
+cyan completely *and* keeps the yellow colony yellow, the pink plates pink,
+the purple coral purple — where the local-illuminant reference (second column)
+renders a flatter beige. Raising `l` past 1.0 (fourth column) over-reddens:
+
+![water-column series, healthy frame](docs/images/G0019067_watercolumn_series.png)
+
+**The physical limit, honestly** — same comparison on a frame whose deep zone
+is 70–85% *below the sensor noise floor* (raw red < 0.02). No method can
+recover colour that was never recorded: the local-illuminant reference hides
+those dead pixels under a false salmon-pink cast; water-column mode corrects
+everything with real signal and leaves the dead pixels visibly cyan. Prefer
+the honest rendering — and know your survey's dead-red fraction *before* a
+full run (the QC script reports it; this survey: 92% of frames in good shape):
+
+![water-column series, noise-floor frame](docs/images/G0020539_watercolumn_series.png)
+
+### Results (full 1939-image run with the recipe above)
+
+Raw vs corrected across the survey's whole depth range — same recipe, one
+frozen calibration, no per-image tuning:
+
+![results before/after](docs/images/results_before_after.png)
+
+Quantified over an 78-frame sample of the output (deep = deepest 15% of each
+frame's pixels, measured where the raw red channel carries real signal):
+
+| Metric | Result |
+| --- | --- |
+| Deep-pixel red/blue ratio (1.0 = neutral, water fully removed) | p50 **0.94** (p10 0.63, p90 1.07) |
+| Deep vs shallow colour consistency | p50 **0.93** |
+| Frames with residual water in the deep zone (deep R/B < 0.5) | **0** / 78 |
+| Frames with red/pink over-correction (deep R/B > 1.3) | **0** / 78 |
+| Throughput (full-res survey-locked, 1 core, Ryzen 5800H) | ~6.5 s/image → ~3.5 h for 1939 |
+
+For comparison, the unmodified pipeline (two-term fit, local illuminant) on
+the same survey scored **0.23** deep-vs-shallow consistency — the deep half of
+every dropoff frame stayed blue. The remaining honest limits: pixels whose raw
+red sits below the sensor noise floor render neutral-cyan rather than
+recovering colour (~8% of frames have a substantial such zone on this survey),
+and frames whose depth distribution is dominated by a shallow majority can
+under-correct their small deep tail (~1 in 6 dropoff-type frames, visible as
+residual cyan at the very deepest edge).
 
 > **`l` on a reef survey:** with `coarse` mode the paper default `--l 1.0` is
 > right. Do **not** reflexively lower `l` to fix over-brightness on shallow
@@ -324,6 +626,9 @@ All tunable knobs live in one place: `seathru.core.SeathruParams` (mirrored
 | `f` | `--f` | `2.0` | Illuminant geometry factor (paper uses 2). Raises overall brightness. |
 | `l` | `--l` | `1.0` | Attenuation/brightness balance — **the main strength dial**. Lower if far/deep areas over-brighten — **but not on a downward survey**, where lowering it starves the deep correction (see [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping)). |
 | `attenuation_mode` | `--attenuation-mode` | `two-term` | `two-term` = paper Eq. 11 decaying fit (horizontal imaging). `coarse` = illuminant-derived `β_D` (Eq. 12); **required for downward-looking surveys**. |
+| `illuminant_mode` | `--illuminant-mode` | `local` | `local` = paper Eq. 14 local space-average. `water-column` = per-channel exponential fit in range; preserves relative object colour on downward surveys (see above). |
+| `saturation` | `--saturation` | `1.0` | Post-recovery chroma gain. `1.4–1.6` restores the punch that physically-correct removal flattens; uniform, so survey-consistent. |
+| `hue_depth_flatten` | `--hue-depth-flatten` | `0.0` | Strength (0–1) of a self-calibrating depth-hue trend removal, pivoted at the shallow end. Tested but **not** part of the recommended recipe — `water-column` addresses the cause rather than the symptom. |
 | `epsilon` | `--epsilon` | `0.05` | Iso-range neighbourhood band width (Eq. 15), fraction of the scene's depth span. |
 | `protect_red` | `--no-protect-red` to disable | `True` | White-balance red gently instead of pure Gray-World (avoids pink cast on red-starved deep frames). |
 | `stretch_pct` | `--stretch-low` / `--stretch-high` | `(0.5, 99.5)` | Output contrast-stretch percentiles. Widen toward `(0.1, 99.9)` for a flatter, safer result; tighten for more punch. |
@@ -493,9 +798,59 @@ metric on a synthetic scene).
   two-term fit with the Eq. 12 coarse `β_D` for straight-down imaging, where the
   paper's horizontal-imaging assumption makes the decaying two-term form fit the
   wrong sign of range dependence. Opt-in; the default (`two-term`) matches the
-  paper. `--no-lock-backscatter` and the `--depth colmap` MVS-depth hygiene
-  flags (`--colmap-clip-low`, `--colmap-fill-holes`) are also additions for
-  real SfM depth, not part of the paper.
+  paper.
+- **`--illuminant-mode water-column`** replaces the paper's local space-average
+  illuminant (Eq. 14) with a per-channel exponential fit in range. The local
+  form embeds a local gray-world assumption that mis-colours genuinely
+  non-gray zones, with an error that grows with depth (deep yellows turn red).
+  Opt-in; the default (`local`) matches the paper.
+- **`--saturation`** is a post-recovery chroma gain (not in the paper) — the
+  physically-correct output tends to look flatter than expected; this restores
+  it uniformly without touching the water model.
+- **`--no-lock-backscatter`** and the `--depth colmap` MVS-depth hygiene flags
+  (`--colmap-clip-low`, `--colmap-fill-holes`, `--colmap-fill-border`, the
+  erosion trust filter, and `--colmap-fill-mono` monocular hole patching) are
+  additions for real SfM depth, not part of the paper.
+- **Survey-locked water-column slope** (with per-frame intercept) and the
+  per-frame **processing-path log / end-of-run summary** are additions for
+  large-survey consistency and auditability.
+- **`--hue-depth-flatten`** (off by default) is an experimental self-calibrating
+  depth-hue trend removal, kept for surveys where `water-column` mode is not
+  applicable; it treats the symptom the illuminant mode fixes at the source.
+
+## Limitations
+
+Stated plainly, because they bound what any write-up can claim:
+
+- **The sensor noise floor is a hard physical limit.** Where the raw red
+  channel recorded ≈0 (deep, turbid, or strongly red-absorbing water), there
+  is no signal to amplify: those pixels render neutral-cyan rather than
+  recovering colour, and *no* post-hoc method can do otherwise. On the test
+  survey ~8% of frames had a substantial such zone (72–85% dead red in the
+  worst two). The recoverability scan quantifies this per survey **before** a
+  run. Shooting RAW, brighter/slower exposures, or artificial lighting are
+  the only real fixes.
+- **Inputs are 8-bit sRGB JPEG**, inverse-gamma'd to approximate linear
+  radiance. The paper's results use linear RAW; JPEG tone-mapping and 8-bit
+  quantisation of dark red values compound the noise-floor problem above. A
+  RAW path is stubbed but untested.
+- **The water-column illuminant assumes one water body per survey** (a single
+  `E_c(z)` slope). Surveys crossing strong turbidity gradients, haloclines,
+  or large time spans (changing sun angle) would need piecewise calibration.
+  Similarly, the exponential (log-linear) form is a first-order model; strong
+  curvature in `ln E(z)` over large depth ranges would call for a richer fit.
+- **Depth-consistency (deep R/B ≈ shallow R/B) is a proxy, not ground truth.**
+  It assumes the deep and shallow scene content have statistically similar
+  intrinsic colour. The gold standard remains in-water colour charts at
+  multiple depths — worth adding to a survey designed for a publication.
+- **Monocular hole patching inherits the network's biases** at object
+  boundaries and on structures it has never seen; the per-image affine
+  alignment corrects global scale/shift, not local shape errors. Patched
+  regions are logged per frame so they can be down-weighted downstream.
+- **The nadir corrections are validated on one survey** (2,022 images, one
+  site, 1.5–5.6 m, one camera). A journal claim needs replication on other
+  sites, depth ranges, cameras, and at least one horizontal-imaging control
+  to show the paper-default path is unharmed.
 
 ## Citing
 

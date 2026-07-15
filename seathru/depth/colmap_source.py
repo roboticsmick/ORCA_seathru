@@ -102,12 +102,69 @@ def read_colmap_array(path):
     return np.transpose(arr, (1, 0, 2)).squeeze()
 
 
+def remove_valid_islands(depth, min_island_frac=0.01, erosion_px=5):
+    """
+    @brief Invalidate untrustworthy *valid* speckles/blobs (MVS noise) so hole
+    fills can only propagate from large, coherent regions.
+
+    Where MVS fails over a region (motion blur, texture-poor patch), the failed
+    zone is rarely 100% invalid — it contains blobs of "valid" pure-noise depth
+    that survive percentile clipping (that clip is global, not spatial). If
+    holes are filled by nearest-valid propagation, those in-zone junk blobs win
+    over the trustworthy rim and the zone inherits garbage depth (observed: a
+    bright motion-blurred band assigned 3.8–7.2 m against a 2.5 m rim → strong
+    false red band after correction).
+
+    Plain connected-component size filtering is NOT sufficient: the junk blobs
+    are usually attached to the main valid region by thin bridges, making them
+    part of one huge component. So instead:
+
+      1. **Erode** the valid mask by ``erosion_px`` — thin bridges and small
+         blobs lose their core; large coherent regions keep one.
+      2. Keep only eroded cores bigger than ``min_island_frac`` of the image.
+      3. Trust exactly the valid pixels within ``erosion_px + 2`` of a kept
+         core (restores the eroded boundary of genuine regions without
+         re-growing through bridges to the junk).
+
+    @param depth (H, W) float range map; ``<= 0`` marks invalid.
+    @param min_island_frac Minimum eroded-core size, as a fraction of image
+        area, for a region to be trusted. 0 disables the filter entirely.
+    @param erosion_px Erosion radius in pixels (bridge-cutting scale).
+    @return (H, W) float depth with untrusted valid pixels zeroed (a copy).
+    """
+    if not min_island_frac:
+        return depth
+    from scipy import ndimage
+
+    valid = depth > 0
+    if valid.all() or not valid.any():
+        return depth
+    core = ndimage.binary_erosion(valid, iterations=erosion_px)
+    labels, n = ndimage.label(core)
+    if n == 0:
+        return depth                     # nothing survives erosion: keep as-is
+    sizes = ndimage.sum(np.ones_like(labels, dtype=np.float32), labels,
+                        index=np.arange(1, n + 1))
+    big = np.nonzero(sizes >= min_island_frac * depth.size)[0] + 1
+    if big.size == 0:
+        return depth
+    keep_core = np.isin(labels, big)
+    dist = ndimage.distance_transform_edt(~keep_core)
+    trusted = valid & (dist <= erosion_px + 2)
+    if trusted.sum() == valid.sum():
+        return depth
+    out = depth.copy()
+    out[valid & ~trusted] = 0.0
+    return out
+
+
 class ColmapDepthSource(DepthSource):
     """@brief Metric depth from a COLMAP dense-MVS workspace; see module docstring."""
 
     def __init__(self, workspace, kind="geometric", clip_percentile=99.5,
                  clip_low_percentile=2.0, fill_holes_max_frac=0.02,
-                 fill_border=False):
+                 fill_border=False, min_island_frac=0.01,
+                 fill_mono=False, mono_backend="midas"):
         """
         @param workspace COLMAP dense workspace directory (containing ``stereo/``).
         @param kind ``"geometric"`` (recommended, multi-view consistent) or
@@ -129,6 +186,17 @@ class ColmapDepthSource(DepthSource):
             Set to 0 to disable.
         @param fill_border Also fill border-touching invalid regions by
             nearest-valid extrapolation (see ``fill_small_depth_holes``).
+        @param min_island_frac Invalidate isolated "valid" components smaller
+            than this fraction of image area before filling (MVS noise
+            speckles inside failed zones — see ``remove_valid_islands``).
+        @param fill_mono Patch invalid regions with **monocular neural depth**
+            aligned per-image to the valid COLMAP pixels (needs torch; see
+            ``_mono_fill``). Much better than nearest-valid extrapolation for
+            large holes, where the true surface is not a continuation of the
+            rim. When enabled it replaces the nearest-valid fill entirely
+            (which remains the fallback if the alignment fails).
+        @param mono_backend Backend for ``fill_mono`` ("midas" or
+            "depth_anything_v2"), see seathru.depth.monocular.
         """
         self.depth_dir = Path(workspace) / "stereo" / "depth_maps"
         self.kind = kind
@@ -136,6 +204,11 @@ class ColmapDepthSource(DepthSource):
         self.clip_low_percentile = clip_low_percentile
         self.fill_holes_max_frac = fill_holes_max_frac
         self.fill_border = fill_border
+        self.min_island_frac = min_island_frac
+        self.fill_mono = fill_mono
+        self.mono_backend = mono_backend
+        self._mono = None          # lazy MonocularDepthSource
+        self.last_notes = []       # per-frame processing notes (for run logs)
 
     def _find(self, image_name):
         """@brief Locate the COLMAP depth-map file for one image.
@@ -147,6 +220,61 @@ class ColmapDepthSource(DepthSource):
             if cand.exists():
                 return cand
         return None
+
+    def _mono_fill(self, img, depth):
+        """
+        @brief Patch invalid depth with monocular depth aligned to COLMAP.
+
+        Monocular networks predict depth up to an unknown affine transform in
+        *inverse* depth. With ~90%+ of the frame carrying metric COLMAP depth,
+        that transform is over-determined: fit ``1/z_colmap ≈ s·d_mono + t``
+        by least squares over the valid overlap (one trimming pass drops the
+        worst 20% residuals — object boundaries and MVS noise), then evaluate
+        the aligned mono depth in the holes only. No training required — the
+        survey's own depth is the per-image supervision.
+
+        @param img (H, W, 3) float image in [0, 1] (working resolution).
+        @param depth (H, W) float COLMAP depth, ``<= 0`` invalid.
+        @return (filled_depth, note_string) — depth unchanged (and a reason in
+            the note) if torch/the model is unavailable or the fit degenerates.
+        """
+        hole = depth <= 0
+        if not hole.any():
+            return depth, None
+        try:
+            if self._mono is None:
+                from .monocular import MonocularDepthSource
+                self._mono = MonocularDepthSource(backend=self.mono_backend)
+            rel = self._mono._infer_relative(img).astype(np.float32)
+        except Exception as err:  # torch missing, hub download failed, OOM...
+            return depth, f"mono-fill UNAVAILABLE ({type(err).__name__}); nearest-fill fallback"
+
+        inv_mono = 1.0 / np.maximum(rel, 1e-6)
+        valid = depth > 0
+        x = inv_mono[valid].ravel()
+        y = (1.0 / depth[valid]).ravel()
+        if x.size > 20000:                      # subsample for speed
+            idx = np.random.default_rng(0).choice(x.size, 20000, replace=False)
+            x, y = x[idx], y[idx]
+        for _ in range(2):                      # LSQ with one trimming pass
+            A = np.c_[x, np.ones_like(x)]
+            (s, t), *_ = np.linalg.lstsq(A, y, rcond=None)
+            resid = np.abs(A @ np.array([s, t]) - y)
+            keep = resid < np.percentile(resid, 80)
+            if keep.sum() < 100:
+                return depth, "mono-fill DEGENERATE fit; nearest-fill fallback"
+            x, y = x[keep], y[keep]
+        if s <= 0:
+            return depth, "mono-fill NEGATIVE scale; nearest-fill fallback"
+        aligned = 1.0 / np.clip(s * inv_mono + t, 1e-6, None)
+        # residual sanity on the (trimmed) overlap, in metres
+        err_m = float(np.median(np.abs(1.0 / np.clip(s * x + t, 1e-6, None) - 1.0 / y)))
+        # clamp holes to a plausible band so a bad mono region cannot explode
+        v = depth[valid]
+        lo_b, hi_b = 0.5 * np.percentile(v, 2), 2.0 * np.percentile(v, 98)
+        out = depth.copy()
+        out[hole] = np.clip(aligned[hole], lo_b, hi_b)
+        return out, f"mono-filled {100 * hole.mean():.1f}% (align err {err_m:.2f} m)"
 
     def get_depth(self, img, meta: ImageMeta):
         """@brief @copydoc DepthSource.get_depth
@@ -167,6 +295,7 @@ class ColmapDepthSource(DepthSource):
         else:
             depth = np.ascontiguousarray(depth, dtype=np.float32)
 
+        self.last_notes = []
         depth[~np.isfinite(depth)] = 0.0
         depth[depth <= 0] = 0.0
         if self.clip_percentile and np.any(depth > 0):
@@ -175,7 +304,17 @@ class ColmapDepthSource(DepthSource):
         if self.clip_low_percentile and np.any(depth > 0):
             lo = np.percentile(depth[depth > 0], self.clip_low_percentile)
             depth[(depth > 0) & (depth < lo)] = 0.0
-        if self.fill_holes_max_frac or self.fill_border:
+        if self.min_island_frac:
+            before = (depth > 0).mean()
+            depth = remove_valid_islands(depth, self.min_island_frac)
+            removed = before - (depth > 0).mean()
+            if removed > 0.001:
+                self.last_notes.append(f"islands-removed {100 * removed:.1f}%")
+        if self.fill_mono:
+            depth, note = self._mono_fill(img, depth)
+            if note:
+                self.last_notes.append(note)
+        if (depth <= 0).any() and (self.fill_holes_max_frac or self.fill_border):
             depth = fill_small_depth_holes(depth, self.fill_holes_max_frac,
                                            fill_border=self.fill_border)
         return depth

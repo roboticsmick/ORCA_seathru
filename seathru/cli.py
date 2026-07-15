@@ -57,7 +57,9 @@ def build_depth_source(args):
         return ColmapDepthSource(args.colmap_workspace, kind=args.colmap_depth_kind,
                                  clip_low_percentile=args.colmap_clip_low,
                                  fill_holes_max_frac=args.colmap_fill_holes,
-                                 fill_border=args.colmap_fill_border)
+                                 fill_border=args.colmap_fill_border,
+                                 fill_mono=args.colmap_fill_mono,
+                                 mono_backend=args.colmap_mono_backend)
     if args.depth == "mono":
         from .depth import MonocularDepthSource
         rng = (args.mono_near, args.mono_far) if args.mono_near else None
@@ -100,6 +102,13 @@ def main(argv=None):
                                   "with the nearest valid depth (--depth colmap) - bounded interpolation, so "
                                   "MVS speckle and occluder holes (fish) don't survive as untreated raw-colour "
                                   "patches mid-frame. 0 disables")
+    depth_group.add_argument("--colmap-fill-mono", action="store_true",
+                             help="Patch invalid depth regions with monocular neural depth aligned per-image "
+                                  "to the valid COLMAP pixels (needs torch; downloads the model on first use). "
+                                  "Far better than nearest-valid extrapolation for LARGE holes (motion blur, "
+                                  "texture-poor zones) where the true surface is not a rim continuation")
+    depth_group.add_argument("--colmap-mono-backend", choices=["midas", "depth_anything_v2"], default="midas",
+                             help="Backend for --colmap-fill-mono")
     depth_group.add_argument("--colmap-fill-border", action="store_true",
                              help="Also fill border-touching invalid depth regions by nearest-valid "
                                   "extrapolation (--depth colmap). Off by default: edge gaps are covered by "
@@ -124,6 +133,23 @@ def main(argv=None):
                             help="Curve-fit random restarts for backscatter (Eq. 10); lower = faster, less robust")
     algo_group.add_argument("--attenuation-restarts", type=int, default=10,
                             help="Curve-fit random restarts for attenuation (Eq. 11); lower = faster, less robust")
+    algo_group.add_argument("--illuminant-mode", choices=["local", "water-column"], default="local",
+                            help="'local' = the paper's local space-average illuminant (Eq. 14) - normalises "
+                                 "local shading but embeds a local gray-world assumption that paints genuinely "
+                                 "coloured zones (deep algae rubble) with a complementary cast growing with "
+                                 "depth. 'water-column' = fit the illuminant as exp(a+b*z) per channel: objects "
+                                 "at the same range get identical correction, preserving relative colour; "
+                                 "natural shading is kept in the output")
+    algo_group.add_argument("--hue-depth-flatten", type=float, default=0.0,
+                            help="Strength (0..1) of the depth-hue self-calibration: removes this fraction of "
+                                 "the measured per-channel hue drift vs range (e.g. deep yellow corals turning "
+                                 "red). Assumes average scene colour is roughly depth-invariant, so keep it "
+                                 "partial (0.5 recommended) - 1.0 can repaint frames whose deep zone is a "
+                                 "genuinely different habitat. 0 disables")
+    algo_group.add_argument("--saturation", type=float, default=1.0,
+                            help="Post-recovery chroma gain (1.0 = off). Physically-correct water removal can "
+                                 "leave colours flatter than expected; 1.2-1.5 restores punch without touching "
+                                 "the water model. Applied uniformly, so survey consistency is preserved")
     algo_group.add_argument("--attenuation-mode", choices=["two-term", "coarse"], default="two-term",
                             help="beta_D estimation. 'two-term' = the paper's Eq. 11 decaying fit (correct for "
                                  "HORIZONTAL imaging). 'coarse' = use the illuminant-derived beta_D (Eq. 12) "
@@ -163,6 +189,9 @@ def main(argv=None):
         backscatter_restarts=args.backscatter_restarts,
         attenuation_restarts=args.attenuation_restarts,
         attenuation_mode=args.attenuation_mode,
+        illuminant_mode=args.illuminant_mode,
+        saturation=args.saturation,
+        hue_depth_flatten=args.hue_depth_flatten,
         return_debug=args.debug,
     )
     depth_source = build_depth_source(args)

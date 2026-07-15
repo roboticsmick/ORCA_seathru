@@ -94,6 +94,7 @@ def calibrate_survey_stats(image_paths, depth_source: DepthSource, meta_map,
     sample = select_calibration_sample(image_paths, sample_size, seed)
 
     backscatter_fits, attenuation_fits, gains, bounds, used = [], [], [], [], []
+    wc_pool = [([], []), ([], []), ([], [])]   # per-channel pooled (z, lnE)
     for i, path in enumerate(sample, 1):
         on_progress(f"[calib {i}/{len(sample)}] {path.name} ...")
         meta = meta_map.get(path.name, ImageMeta(image_name=path.name))
@@ -110,6 +111,10 @@ def calibrate_survey_stats(image_paths, depth_source: DepthSource, meta_map,
             backscatter_fits.append(stats["backscatter_coefs"])
         if stats["attenuation_coefs"] is not None:
             attenuation_fits.append(stats["attenuation_coefs"])
+        if stats.get("wc_samples") is not None:
+            for c in range(3):
+                wc_pool[c][0].append(np.asarray(stats["wc_samples"][c][0]))
+                wc_pool[c][1].append(np.asarray(stats["wc_samples"][c][1]))
         gains.append(stats["wb_gains"])
         bounds.append(stats["stretch_bounds"])
         used.append(path.name)
@@ -121,6 +126,34 @@ def calibrate_survey_stats(image_paths, depth_source: DepthSource, meta_map,
             "valid range maps."
         )
 
+    # Pooled water-column fit: one E_c(z) = exp(a + b z) per channel across the
+    # calibration frames, covering the survey's full depth range so even frames
+    # too flat to fit their own exponential get the correct survey-wide water
+    # model at apply time.
+    #
+    # The slope is the pooled WITHIN-frame estimator (fixed-effects): each
+    # frame's samples are de-meaned before contributing. Fitting the raw pooled
+    # samples instead lets between-frame differences (auto-exposure: deeper
+    # frames are darker overall) masquerade as depth attenuation, inflating the
+    # slope — observed as pink over-correction on the deepest frames.
+    wc_coefs, wc_z_range = None, None
+    n_wc_frames = len(wc_pool[0][0])
+    if n_wc_frames >= 3:
+        wc_coefs = np.zeros((3, 2))
+        for c in range(3):
+            num = den = 0.0
+            offsets = []
+            for zs, ys in zip(wc_pool[c][0], wc_pool[c][1]):
+                zc, yc = zs - zs.mean(), ys - ys.mean()
+                num += float(np.dot(zc, yc))
+                den += float(np.dot(zc, zc))
+            b = num / max(den, 1e-9)
+            for zs, ys in zip(wc_pool[c][0], wc_pool[c][1]):
+                offsets.append(float(ys.mean() - b * zs.mean()))
+            wc_coefs[c] = (float(np.median(offsets)), b)
+        z_all = np.concatenate(wc_pool[0][0])
+        wc_z_range = (float(z_all.min()), float(z_all.max()))
+
     return SurveyStats(
         backscatter_coefs=(np.median(np.stack(backscatter_fits), axis=0)
                            if backscatter_fits else None),
@@ -128,6 +161,8 @@ def calibrate_survey_stats(image_paths, depth_source: DepthSource, meta_map,
                            if attenuation_fits else None),
         wb_gains=np.median(np.stack(gains), axis=0),
         stretch_bounds=tuple(np.median(np.array(bounds), axis=0).tolist()),
+        wc_illum_coefs=wc_coefs,
+        wc_z_range=wc_z_range,
         n_calibration_images=len(used),
         source_images=used,
     )

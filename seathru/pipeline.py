@@ -16,6 +16,8 @@ Two processing modes, selected by ``survey_locked``:
 """
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -62,7 +64,7 @@ def process_image(image_path, depth_source: DepthSource, meta: ImageMeta,
     full_depths = depth_source.get_depth(full_img, meta)
     recovered = upsample_and_recover(full_img, full_depths, est, params)
     result = SeathruResult(recovered, est.backscatter, est.illuminant,
-                           est.beta_D, est.neighborhood_map)
+                           est.beta_D, est.neighborhood_map, notes=est.notes)
     return result, img
 
 
@@ -146,6 +148,7 @@ def process_folder(input_dir, out_dir, depth_source: DepthSource,
         params = replace(params, locked_stats=stats)
 
     results = []
+    path_counts = Counter()
     for i, path in enumerate(images, 1):
         meta = meta_map.get(path.name, ImageMeta(image_name=path.name))
         on_progress(f"[{i}/{len(images)}] {path.name} ...")
@@ -155,9 +158,28 @@ def process_folder(input_dir, out_dir, depth_source: DepthSource,
         except Exception as err:  # keep the batch going
             on_progress(f"    FAILED: {err}")
             results.append((path.name, f"error: {err}"))
+            path_counts["FAILED"] += 1
             continue
+        # Processing-path notes: which code path each component took (illum
+        # mode/fallbacks from run_seathru, depth fill actions from the source).
+        notes = list(result.notes)
+        notes += getattr(depth_source, "last_notes", [])
+        for note in notes:
+            # Aggregate on the note's kind, not its per-frame numbers:
+            # "mono-filled 13.0% (align err 0.10 m)" -> "mono-filled".
+            path_counts[re.split(r"[\d(]", note)[0].strip()] += 1
+        if notes:
+            on_progress(f"    [{'; '.join(notes)}]")
         save_image(out_dir / f"{path.stem}_seathru.png", result.recovered)
         if debug and result.backscatter is not None:
             save_debug_panel(out_dir / f"{path.stem}_debug.png", result, img)
         results.append((path.name, "ok"))
+
+    # End-of-run audit: every distinct processing path and how many frames
+    # took it. An unexpected entry here (fallbacks, failures, heavy fills) is
+    # the first place to look when some frames come out different.
+    if path_counts:
+        on_progress("\nProcessing-path summary:")
+        for note, count in path_counts.most_common():
+            on_progress(f"  {count:5d}x  {note}")
     return results

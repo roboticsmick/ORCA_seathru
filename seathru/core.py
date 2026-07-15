@@ -458,8 +458,195 @@ def _compute_direct(img, depths, B, beta_D, nmap):
     return direct
 
 
+def _apply_saturation(rgb, saturation):
+    """@brief Scale chroma about the per-pixel channel mean (1.0 = no change).
+    @param rgb (H, W, 3) float array in [0, 1].
+    @param saturation Chroma gain; >1 richer colours, <1 toward grayscale.
+    @return (H, W, 3) float array, clipped to [0, 1]."""
+    if saturation == 1.0:
+        return rgb
+    mean = rgb.mean(axis=-1, keepdims=True)
+    return np.clip(mean + saturation * (rgb - mean), 0.0, 1.0)
+
+
+def fit_water_column_illuminant(illum, depths, nmap):
+    """
+    @brief Replace the local space-average illuminant with a per-channel
+    exponential fit in range: ``E_c(z) = exp(a_c + b_c z)``.
+
+    The paper's local illuminant (Eq. 14) embeds a *local* gray-world
+    assumption: whatever the neighbourhood's average colour is gets normalised
+    toward neutral. Where the seabed is genuinely coloured (green algae rubble
+    in the deep zone of a reef), that assumption paints the whole zone with the
+    complementary cast, and the error grows with range because the correction
+    is exponential in z - yellow/orange objects visibly redden with depth.
+
+    Fitting the illuminant as a smooth function of range only keeps the
+    depth-dependence (the actual water column) and discards the scene-colour
+    dependence: two objects at the same range receive identical correction, so
+    their relative colour is preserved. Side effect: local shading/caustics are
+    no longer flattened - natural shading survives in the output.
+
+    @param illum (H, W, 3) float local illuminant map from estimate_illumination.
+    @param depths (H, W) float range map in metres.
+    @param nmap (H, W) int neighbourhood label map (0 = invalid/background).
+    @return Tuple ``(illum, fitted)`` — the smooth illuminant map and True, or
+        the input unchanged and False where the fit is degenerate (no depth
+        relief / too few valid samples). A False here means the frame silently
+        used the local illuminant; callers should surface that in run notes
+        (an unnoticed mode flip shows up as an abrupt saturation change
+        between neighbouring frames).
+    """
+    samples = wc_bin_samples(illum, depths, nmap)
+    if samples is None:
+        return illum, False
+    m = (depths > 0) & (nmap != 0)
+    z_all = depths[m]
+    out = np.empty_like(illum)
+    for c in range(3):
+        zs, ys = samples[c]
+        b, a = np.polyfit(zs, ys, 1)
+        # Fit on the robust interior (p5-p95 bins) but EXTRAPOLATE over the full
+        # valid range: the deepest pixels are precisely where the correction
+        # matters most - freezing E at the p95 value leaves residual cyan there.
+        zz = np.clip(depths, z_all.min(), z_all.max())
+        out[..., c] = np.exp(a + b * zz)
+    return np.clip(out, EPS, 1.0), True
+
+
+def wc_bin_samples(illum, depths, nmap, min_relief=0.3, min_bins=4):
+    """
+    @brief Binned-median ``(z, ln E_c)`` samples for the water-column fit.
+
+    Shared by the per-frame fit (fit_water_column_illuminant) and survey
+    calibration, which pools these samples across calibration frames so that
+    flat frames can reuse the survey-wide water model instead of falling back
+    to the local illuminant.
+
+    @param illum (H, W, 3) float local illuminant map.
+    @param depths (H, W) float range map in metres.
+    @param nmap (H, W) int neighbourhood label map (0 = invalid/background).
+    @param min_relief Minimum p95-p5 depth span (m) for a usable per-frame
+        *slope* fit. Pass 0 when only the intercept is needed (locked-slope
+        mode) — any frame with valid pixels can support an intercept.
+    @param min_bins Minimum populated bins per channel (4 for a slope fit;
+        1 suffices for an intercept).
+    @return List of 3 ``(zs, ys)`` array pairs (one per channel), or ``None``
+        if this frame cannot support a fit (insufficient relief or samples).
+    """
+    m = (depths > 0) & (nmap != 0)
+    if m.sum() < 500:
+        return None
+    z_all = depths[m]
+    lo, hi = np.percentile(z_all, [5, 95])
+    if hi - lo < min_relief:
+        return None
+    bins = np.linspace(lo, max(hi, lo + 1e-3), 10)
+    out = []
+    for c in range(3):
+        good = m & (illum[..., c] > EPS)
+        zs, ys = [], []
+        for i in range(len(bins) - 1):
+            s = good & (depths >= bins[i]) & (depths < bins[i + 1])
+            if s.sum() < 100:
+                continue
+            zs.append(0.5 * (bins[i] + bins[i + 1]))
+            ys.append(np.log(np.median(illum[..., c][s])))
+        if len(zs) < min_bins:
+            return None
+        out.append((np.array(zs), np.array(ys)))
+    return out
+
+
+def wc_illum_from_coefs(depths, coefs, z_range):
+    """
+    @brief Build a water-column illuminant map from locked survey coefficients.
+    @param depths (H, W) float range map in metres.
+    @param coefs (3, 2) array of ``[a_c, b_c]`` per channel.
+    @param z_range ``(z_lo, z_hi)`` clamp for evaluation (the fitted span).
+    @return (H, W, 3) float illuminant map.
+    """
+    zz = np.clip(depths, z_range[0], z_range[1])
+    illum = np.stack([np.exp(coefs[c][0] + coefs[c][1] * zz)
+                      for c in range(3)], axis=2)
+    return np.clip(illum, EPS, 1.0)
+
+
+def flatten_depth_hue(img, depths, B, beta_D, nmap, strength=1.0,
+                      max_offset=0.08):
+    """
+    @brief Remove depth-dependent hue drift from a beta_D map (self-calibrating).
+
+    The coarse per-channel beta_D is derived from the illuminant map, which
+    carries scene-colour bias (a reef is not gray). A small per-channel bias in
+    beta is multiplied by ``z`` inside ``exp(beta*z)``, so recovered hue drifts
+    with range: red gets progressively over-boosted and green under-boosted,
+    turning deep yellow corals red while shallow ones stay true.
+
+    Under the assumption that the *average* scene colour does not genuinely
+    change with depth (gray-world across depth, the same assumption behind the
+    global white balance), the mean log ratio between channels should be
+    range-invariant after correction. This function regresses each channel's
+    mean log direct-signal against range, subtracts the cross-channel mean
+    slope (preserving the shared brightness fall-off), and removes the
+    per-channel differential slope from beta_D.
+
+    @param img (H, W, 3) float input image in [0, 1].
+    @param depths (H, W) float range map in metres.
+    @param B (H, W, 3) float per-pixel backscatter.
+    @param beta_D (H, W, 3) float attenuation coefficient map to correct.
+    @param nmap (H, W) int neighbourhood label map (0 = invalid/background).
+    @param strength Fraction of the measured hue drift to remove (0..1). The
+        gray-world-across-depth assumption is only approximately true - a frame
+        whose deep zone is genuinely a different habitat (rubble vs coral) has a
+        *real* colour trend that full-strength correction would wrongly remove.
+        0.5 is a good default: halves the drift, bounded scene damage.
+    @param max_offset Clamp on the per-channel beta adjustment (1/m). Caps how
+        much the correction can repaint the scene when the assumption fails.
+    @return Corrected (H, W, 3) beta_D map.
+    """
+    NOISE_FLOOR = 0.02   # raw values below this carry no colour information
+
+    m = (depths > 0) & (nmap != 0)
+    if m.sum() < 500:
+        return beta_D
+    direct = (img - B) * np.exp(beta_D * depths[..., None])
+    z_all = depths[m]
+    lo, hi = np.percentile(z_all, [5, 95])
+    if hi - lo < 0.5:                # no usable depth relief in this frame
+        return beta_D
+    bins = np.linspace(lo, hi, 8)
+    slopes = np.zeros(3)
+    for c in range(3):
+        # Exclude pixels whose RAW channel is at the sensor noise floor: their
+        # boosted values are amplified noise and would swamp the regression
+        # (deep red is often mostly dead - exactly where this fix matters).
+        good = m & (img[..., c] > NOISE_FLOOR) & (direct[..., c] > 1e-4)
+        zs, ys = [], []
+        for i in range(len(bins) - 1):
+            s = good & (depths >= bins[i]) & (depths < bins[i + 1])
+            if s.sum() < 100:
+                continue
+            zs.append(0.5 * (bins[i] + bins[i + 1]))
+            ys.append(np.log(np.median(direct[..., c][s])))
+        if len(zs) < 4:
+            return beta_D            # not enough clean signal to calibrate
+        slopes[c] = np.polyfit(zs, ys, 1)[0]
+    slopes -= slopes.mean()          # keep shared brightness trend, kill hue trend
+    slopes = np.clip(strength * slopes, -max_offset, max_offset)
+    # Pivot the correction at the shallow end (z_ref) instead of z=0: the user-
+    # visible symptom is hue drifting *relative to the shallow scene*, which
+    # looks right. beta' z = beta z - s (z - z_ref)  =>  no change at z_ref,
+    # growing correction with depth, slight opposite nudge shallower.
+    z_ref = np.percentile(z_all, 10)
+    zz = np.where(depths > 0, depths, z_ref)
+    factor = np.clip(1.0 - z_ref / np.maximum(zz, 1e-6), -0.5, 1.0)
+    return beta_D - slopes[None, None, :] * factor[..., None]
+
+
 def recover_image(img, depths, B, beta_D, nmap, protect_red=True,
-                  stretch_pct=(0.5, 99.5), wb_gains=None, stretch_bounds=None):
+                  stretch_pct=(0.5, 99.5), wb_gains=None, stretch_bounds=None,
+                  saturation=1.0):
     """
     @brief Equation 8 + Equation 9: remove backscatter, undo range attenuation, then
     white balance. Invalid pixels keep their original colour.
@@ -476,12 +663,16 @@ def recover_image(img, depths, B, beta_D, nmap, protect_red=True,
         the per-image Gray-World fit is skipped (survey-locked mode).
     @param stretch_bounds Optional precomputed ``(lo, hi)`` stretch bounds; when
         given, the per-image percentile stretch is skipped (survey-locked mode).
+    @param saturation Post-recovery chroma gain (SeathruParams.saturation).
+        Physically-correct attenuation removal can leave colours flatter than
+        the eye expects; this restores punch without touching the water model.
     @return (H, W, 3) float recovered image in [0, 1].
     """
     direct = _compute_direct(img, depths, B, beta_D, nmap)
     bg = nmap == 0
     gains = wb_gains if wb_gains is not None else _compute_wb_gains(direct, protect_red)
     out = _robust_stretch(_apply_wb_gains(direct, gains), ~bg, stretch_pct, stretch_bounds)
+    out = _apply_saturation(out, saturation)
     out[bg] = img[bg]
     return np.clip(out, 0.0, 1.0)
 
@@ -548,6 +739,9 @@ class SeathruParams:
     attenuation_restarts: int = 10
     spread_fraction: float = 0.01
     attenuation_mode: str = "two-term"
+    illuminant_mode: str = "local"
+    saturation: float = 1.0
+    hue_depth_flatten: float = 0.0
     locked_stats: "SurveyStats | None" = None
     return_debug: bool = False
 
@@ -580,6 +774,17 @@ class SurveyStats:
         (``--lock-exposure``); otherwise each frame keeps its own percentile
         stretch even in survey-locked mode, since scene brightness legitimately
         varies with altitude/sun angle.
+    @param wc_illum_coefs (3, 2) float array of water-column illuminant
+        coefficients ``[a_c, b_c]`` per RGB channel (``E_c(z) = exp(a + b z)``),
+        pooled over all calibration frames, or ``None``. The water column is a
+        property of the *survey*, not the frame: locking it (a) gives frames
+        with too little depth relief to fit their own exponential the correct
+        survey-wide water model instead of silently falling back to the local
+        illuminant (observed as an abrupt washed-out ↔ saturated flip between
+        neighbouring frames at the relief threshold), and (b) removes
+        per-frame fit variability entirely.
+    @param wc_z_range ``(z_lo, z_hi)`` metres over which ``wc_illum_coefs``
+        were fitted; evaluation clamps z into this range.
     @param n_calibration_images Number of sample frames actually used.
     @param source_images File names of the sampled calibration frames (for
         provenance / debugging).
@@ -588,6 +793,8 @@ class SurveyStats:
     attenuation_coefs: "np.ndarray | None" = None
     wb_gains: "np.ndarray | None" = None
     stretch_bounds: "tuple | None" = None
+    wc_illum_coefs: "np.ndarray | None" = None
+    wc_z_range: "tuple | None" = None
     n_calibration_images: int = 0
     source_images: list = field(default_factory=list)
 
@@ -602,6 +809,10 @@ class SurveyStats:
             "wb_gains": self.wb_gains.tolist() if self.wb_gains is not None else None,
             "stretch_bounds": (list(self.stretch_bounds)
                                if self.stretch_bounds is not None else None),
+            "wc_illum_coefs": (self.wc_illum_coefs.tolist()
+                               if self.wc_illum_coefs is not None else None),
+            "wc_z_range": (list(self.wc_z_range)
+                           if self.wc_z_range is not None else None),
             "n_calibration_images": self.n_calibration_images,
             "source_images": self.source_images,
         }
@@ -619,6 +830,10 @@ class SurveyStats:
             wb_gains=(np.array(d["wb_gains"]) if d.get("wb_gains") is not None else None),
             stretch_bounds=(tuple(d["stretch_bounds"])
                             if d.get("stretch_bounds") is not None else None),
+            wc_illum_coefs=(np.array(d["wc_illum_coefs"])
+                            if d.get("wc_illum_coefs") is not None else None),
+            wc_z_range=(tuple(d["wc_z_range"])
+                        if d.get("wc_z_range") is not None else None),
             n_calibration_images=d.get("n_calibration_images", 0),
             source_images=d.get("source_images", []),
         )
@@ -647,12 +862,17 @@ class SeathruResult:
         mode, and only computed at all when needed (see run_seathru).
     @param beta_D (H, W, 3) float direct attenuation coefficient map. Debug only.
     @param neighborhood_map (H, W) int iso-range neighbourhood labels. Debug only.
+    @param notes List of short strings recording which processing path each
+        component took (e.g. ``"illum: wc-locked"``, ``"illum:
+        wc-FALLBACK-local"``). Always populated; surfaced by the pipeline's
+        per-image log and end-of-run summary so silent mode flips are visible.
     """
     recovered: np.ndarray
     backscatter: np.ndarray = field(default=None, repr=False)
     illuminant: np.ndarray = field(default=None, repr=False)
     beta_D: np.ndarray = field(default=None, repr=False)
     neighborhood_map: np.ndarray = field(default=None, repr=False)
+    notes: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -681,12 +901,15 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
     img = np.asarray(img, dtype=np.float64)
     depths = np.asarray(depths, dtype=np.float64)
     locked = params.locked_stats
+    notes = []
 
     valid = depths > 0
     if not np.any(valid) or (depths[valid].max() - depths[valid].min()) < 1e-3:
         # Constant / missing range map (e.g. PlaneDepthSource): the range-fit is
         # degenerate, so fall back to backscatter removal + white balance only.
-        return _run_constant_depth(img, params)
+        result = _run_constant_depth(img, params)
+        result.notes.append("CONSTANT-DEPTH fallback (no spatial range map)")
+        return result
 
     if locked is not None and locked.backscatter_coefs is not None:
         B = np.stack([_backscatter_model(depths, *locked.backscatter_coefs[c])
@@ -712,6 +935,40 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
             estimate_illumination(img[..., c], B[..., c], nmap, n,
                                   p=params.p, f=params.f)
             for c in range(3)], axis=2)
+        if params.illuminant_mode == "water-column":
+            if locked is not None and locked.wc_illum_coefs is not None:
+                # Locked SLOPE, per-frame INTERCEPT. The depth slope of the
+                # illuminant is a property of the water column — identical for
+                # every frame — so the survey-calibrated value is used and flat
+                # frames never fall back to the local illuminant (a silent
+                # fallback shows up as an abrupt saturation flip between
+                # neighbours). The intercept is a property of the frame
+                # (auto-exposure / auto-white-balance drift) and MUST stay
+                # per-frame: locking it too passes camera AWB drift straight
+                # into the output as whole-frame colour casts.
+                samples = wc_bin_samples(illum, depths, nmap,
+                                         min_relief=0.0, min_bins=1)
+                if samples is not None:
+                    z_range = (locked.wc_z_range or
+                               (float(depths[depths > 0].min()),
+                                float(depths[depths > 0].max())))
+                    zz = np.clip(depths, z_range[0], z_range[1])
+                    smooth = np.empty_like(illum)
+                    for c in range(3):
+                        b = locked.wc_illum_coefs[c][1]
+                        zs, ys = samples[c]
+                        a = float(np.median(ys - b * zs))
+                        smooth[..., c] = np.exp(a + b * zz)
+                    illum = np.clip(smooth, EPS, 1.0)
+                    notes.append("illum: wc-locked-slope")
+                else:
+                    notes.append("illum: wc-FALLBACK-local (no samples)")
+            else:
+                illum, fitted = fit_water_column_illuminant(illum, depths, nmap)
+                notes.append("illum: wc-frame-fit" if fitted
+                             else "illum: wc-FALLBACK-local")
+        else:
+            notes.append("illum: local")
 
     # Locked coefficients are two-term (Eq. 11) fits, so they do not apply in
     # "coarse" mode, where beta_D comes straight from this image's illuminant.
@@ -728,17 +985,22 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
                                mode=params.attenuation_mode)[0]
             for c in range(3)], axis=2)
 
+    if params.hue_depth_flatten:
+        beta_D = flatten_depth_hue(img, depths, B, beta_D, nmap,
+                                   strength=params.hue_depth_flatten)
+
     wb_gains = locked.wb_gains if locked is not None else None
     stretch_bounds = (locked.stretch_bounds
                       if (locked is not None and locked.stretch_bounds is not None)
                       else None)
     recovered = recover_image(img, depths, B, beta_D, nmap, params.protect_red,
                               params.stretch_pct, wb_gains=wb_gains,
-                              stretch_bounds=stretch_bounds)
+                              stretch_bounds=stretch_bounds,
+                              saturation=params.saturation)
 
     if not params.return_debug:
-        return SeathruResult(recovered=recovered)
-    return SeathruResult(recovered, B, illum, beta_D, nmap)
+        return SeathruResult(recovered=recovered, notes=notes)
+    return SeathruResult(recovered, B, illum, beta_D, nmap, notes=notes)
 
 
 def upsample_and_recover(full_img, full_depths, result: "SeathruResult",
@@ -784,7 +1046,8 @@ def upsample_and_recover(full_img, full_depths, result: "SeathruResult",
                       else None)
     return recover_image(full_img, full_depths, B, beta_D, nmap,
                          params.protect_red, params.stretch_pct,
-                         wb_gains=wb_gains, stretch_bounds=stretch_bounds)
+                         wb_gains=wb_gains, stretch_bounds=stretch_bounds,
+                         saturation=params.saturation)
 
 
 def _run_constant_depth(img, params: SeathruParams):
@@ -814,6 +1077,7 @@ def _run_constant_depth(img, params: SeathruParams):
                       else None)
     out = _robust_stretch(_apply_wb_gains(direct, gains), None,
                           params.stretch_pct, stretch_bounds)
+    out = _apply_saturation(out, params.saturation)
     if not params.return_debug:
         return SeathruResult(recovered=out)
     B_map = np.broadcast_to(B, img.shape)
@@ -851,10 +1115,18 @@ def _fit_calibration_sample(img, depths, params: SeathruParams):
     backscatter_coefs = None if any(c is None for c in back_coefs) else np.stack(back_coefs)
 
     nmap, n = construct_neighborhood_map(depths, params.epsilon, params.min_neighborhood)
+    illum_stack = np.stack([
+        estimate_illumination(img[..., c], B[..., c], nmap, n,
+                              p=params.p, f=params.f)
+        for c in range(3)], axis=2)
+    # Collected from the LOCAL illuminant (pre-fit) so survey calibration can
+    # pool them across frames into one survey-wide water-column model.
+    wc_samples = wc_bin_samples(illum_stack, depths, nmap)
+    if params.illuminant_mode == "water-column":
+        illum_stack, _ = fit_water_column_illuminant(illum_stack, depths, nmap)
     illum_channels, atten_coefs = [], []
     for c in range(3):
-        illum_c = estimate_illumination(img[..., c], B[..., c], nmap, n,
-                                        p=params.p, f=params.f)
+        illum_c = illum_stack[..., c]
         illum_channels.append(illum_c)
         _, coefs = refine_attenuation(depths, illum_c, coarse_attenuation(depths, illum_c),
                                       restarts=params.attenuation_restarts, l=1.0,
@@ -888,6 +1160,7 @@ def _fit_calibration_sample(img, depths, params: SeathruParams):
         "attenuation_coefs": attenuation_coefs,
         "wb_gains": wb_gains,
         "stretch_bounds": (float(lo), float(hi)),
+        "wc_samples": wc_samples,
     }
 
 
@@ -915,4 +1188,5 @@ def _run_constant_depth_stats(img, params: SeathruParams):
         "attenuation_coefs": None,
         "wb_gains": wb_gains,
         "stretch_bounds": (float(lo), float(hi)),
+        "wc_samples": None,
     }
