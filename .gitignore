@@ -26,3 +26,4 @@ micmac/
 
 .DS_Store
 Thumbs.db
+docs/images/*.tif
