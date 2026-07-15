@@ -141,8 +141,17 @@ def main(argv=None):
                     help="Sample every Nth pixel of each frame (previews)")
     ap.add_argument("--depth-kind", choices=["geometric", "photometric"],
                     default="photometric")
-    ap.add_argument("--max-view-z", type=float, default=None,
-                    help="Skip samples farther than this range (m) from the camera")
+    ap.add_argument("--max-view-z", type=float, default=8.0,
+                    help="Skip samples farther than this range (m) from the camera "
+                         "(kills 'radial spike' depth outliers; 0 disables)")
+    ap.add_argument("--border-trim", type=int, default=15,
+                    help="Ignore this many pixels around each frame's border — "
+                         "MVS depth is least reliable there and border junk "
+                         "splashes off-surface at strip edges (0 disables)")
+    ap.add_argument("--elev-min", type=float, default=-15.0,
+                    help="Reject samples below this ENU elevation (m; cameras ~0)")
+    ap.add_argument("--elev-max", type=float, default=0.3,
+                    help="Reject samples above this ENU elevation (above water!)")
     args = ap.parse_args(argv)
 
     ws = Path(args.colmap_workspace)
@@ -184,6 +193,12 @@ def main(argv=None):
             img = np.asarray(Image.open(cpath).convert("RGB").resize((cw, ch)))
         z = src.get_depth(img.astype(np.float32) / 255.0,
                           ImageMeta(image_name=name))
+        if args.border_trim:
+            bt = args.border_trim
+            z[:bt, :] = 0
+            z[-bt:, :] = 0
+            z[:, :bt] = 0
+            z[:, -bt:] = 0
         s = args.pixel_stride
         zz = z[::s, ::s]
         valid = zz > 0
@@ -200,7 +215,8 @@ def main(argv=None):
         Xw = (R.T @ (np.stack([xc, yc, zs]) - t[:, None]))
         gx = ((Xw[0] - xmin) / args.gsd).astype(np.int32)
         gy = ((ymax - Xw[1]) / args.gsd).astype(np.int32)
-        inb = (gx >= 0) & (gx < W) & (gy >= 0) & (gy < H)
+        inb = ((gx >= 0) & (gx < W) & (gy >= 0) & (gy < H)
+               & (Xw[2] > args.elev_min) & (Xw[2] < args.elev_max))
         if not inb.any():
             continue
         gx, gy = gx[inb], gy[inb]

@@ -48,6 +48,7 @@ attenuation).
 - [Pipeline: correcting a dataset](#pipeline-correcting-a-dataset)
 - [Survey-locked mode](#survey-locked-mode)
 - [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping)
+- [Orthomosaic (GeoTIFF)](#orthomosaic-a-georeferenced-geotiff-straight-from-the-pipeline)
 - [Configuration / tunable parameters](#configuration--tunable-parameters)
 - [Time estimates](#time-estimates)
 - [Large datasets (10k+ images) → COLMAP](#large-datasets-10k-images--colmap-on-a-laptop)
@@ -685,6 +686,51 @@ residual cyan at the very deepest edge).
 > recover colour — there is no signal to amplify. `scripts/seathru_qc_variants.py`
 > reports the fraction of a survey that is in this regime so you know what to
 > expect before a full run.
+
+## Orthomosaic: a georeferenced GeoTIFF straight from the pipeline
+
+Once a survey is corrected, an orthomosaic needs **no further photogrammetry**
+— the poses and the metric surface already exist. `scripts/build_orthomosaic.py`
+streams each corrected frame, back-projects every pixel to the seafloor
+through its own COLMAP depth map, keeps the highest-elevation sample per
+ground cell (top-of-coral wins — correct occlusion handling for nadir
+imagery), and writes a tiled, compressed GeoTIFF in the survey's UTM zone,
+ready to drop into QGIS:
+
+![orthomosaic preview](docs/images/orthomosaic_preview.jpg)
+
+*The full 2,022-frame test survey as a single orthomosaic: 10,200 × 10,015 px
+at 3 mm/px (~20 × 20 m of reef), EPSG:32755, built in **30 minutes** on one
+CPU core at ~1 s/frame with <1 GB of RAM. Survey-locked colour means the
+strips join without feathering or seam blending.*
+
+```bash
+python scripts/build_orthomosaic.py \
+    --corrected-dir my_survey/seathru_out \
+    --colmap-workspace my_survey/colmap/dense \
+    --csv my_survey/processed_images.csv \
+    --out my_survey/orthomosaic.tif \
+    --gsd 0.003
+```
+
+Notes:
+
+- **No matching, no heading, no neighbour selection** — those concerns belong
+  to SfM, which is already done. Poses encode full orientation; RAM and CPU
+  are bounded by construction (one frame in memory + the output grid).
+- Pick `--gsd` near your imagery's native ground footprint (`altitude / focal
+  length in px` — ~2.5 mm for a GoPro at 1.7 m); halving GSD quadruples grid
+  RAM but changes nothing else.
+- Depth-outlier hygiene is on by default and matters at strip edges:
+  `--border-trim 15` (MVS depth is least reliable at frame borders),
+  `--max-view-z 8` (rejects implausibly far samples — the "radial spike"
+  artefact), and an elevation sanity band (`--elev-min/--elev-max`).
+- `--subsample N --pixel-stride M` give quick previews (a 1 cm preview of the
+  full survey takes ~3 minutes).
+- For a **DEM/mesh product** (rugosity, contours), pair the corrected images
+  with a full photogrammetry suite (MicMac, OpenDroneMap, Metashape) — but
+  for the orthomosaic itself, reusing the pipeline's own depth is faster by
+  orders of magnitude and inherits the mono-patched, hygiene-filtered depth.
 
 ## Configuration / tunable parameters
 
