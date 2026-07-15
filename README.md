@@ -9,6 +9,15 @@ colour-restoration method from:
 > [Paper (CVF Open Access, PDF)](https://openaccess.thecvf.com/content_CVPR_2019/papers/Akkaynak_Sea-Thru_A_Method_for_Removing_Water_From_Underwater_Images_CVPR_2019_paper.pdf) ·
 > [Project page](http://csms.haifa.ac.il/profiles/tTreibitz/webpage/sea-thru.html)
 
+![raw vs sea-thru corrected](docs/images/hero_before_after.jpg)
+
+*Straight off an autonomous surface vehicle: GoPro frames from a 2,022-image
+reef survey (left) and the same frames after this library's water removal
+(right) — COLMAP metric depth patched with monocular inference, water-column
+illuminant, one survey-locked calibration, no per-image tuning. Top: reef
+drop-off spanning 2.5–6 m in a single frame. Bottom: the survey's deepest
+zone (~6 m).*
+
 Sea-thru was, as far as we're aware, the first method to treat underwater
 image formation as a genuine physical inverse problem — recovering true scene
 colour from a range map rather than applying a global dehazing-style
@@ -176,9 +185,22 @@ AWB drift into the output as whole-frame casts). The slope is pooled with a
 differences cannot masquerade as depth attenuation. This split also removes a
 silent failure mode: frames too flat to fit their own exponential previously
 fell back to the local illuminant, producing abrupt washed-out ↔ saturated
-flips between neighbouring frames. *Evidence:* neighbouring-frame chroma
-difference at the flip boundary 0.02 → 0.008; QC 0/7 problem frames across
-the survey's full depth range.
+flips between neighbouring frames.
+
+Two estimator details proved essential. (a) The intercept is anchored to the
+**direct signal** `I − B`, not to the local space-average illuminant: LSAC's
+overall scale is chaotic on low-relief frames (its iso-depth neighbourhood
+structure fragments when the depth span is tiny) — two near-identical frames
+measured median-E 0.31 vs 0.51, a 60% output-brightness jump that locked
+exposure can no longer re-normalise, rendering one frame blown-white. (b) The
+intercept is a **pixel-weighted** median of `ln(I−B) − b·z`, not a median of
+per-depth-bin medians: reflectance correlates with depth *within* a frame
+(bright coral tops are shallow, dark crevices deep; per-bin medians span ~7×
+in one frame), so bin-weighting lets minority crevice content swing the
+frame's exposure. *Evidence:* neighbouring-frame chroma difference at the
+flip boundary 0.02 → 0.008; the blown-white pair equalised (mean luminance
+0.68/0.46 → 0.52/0.53); whole-survey QC 0/9 problem frames with mean output
+luminance within 0.507–0.539 across the full depth range.
 
 **4. MVS-depth hygiene for real dense-stereo output.** Sea-thru assumes a
 clean range map; real `patch_match_stereo` output is not clean, and each
@@ -526,7 +548,7 @@ python -m seathru.cli \
     --colmap-clip-low 2.0 --colmap-fill-holes 0.02 --colmap-fill-border \
     --colmap-fill-mono \
     --attenuation-mode coarse --illuminant-mode water-column \
-    --l 1.0 --saturation 1.6 --full-res \
+    --l 1.0 --f 2.4 --saturation 1.6 --full-res \
     --survey-locked --lock-exposure --no-lock-backscatter --calib-sample-size 20
 ```
 
@@ -556,6 +578,27 @@ corrected — note the top-edge strip present in the middle tiles is gone):
 
 ![fill levels](docs/images/filllevels_G0018489.png)
 
+**When propagation filling isn't enough — and how monocular patching fixes
+it.** This frame's bottom band is motion-blurred, so MVS failed there — but
+not cleanly: the failed zone contains blobs of "valid" pure-noise depth
+(2–7.2 m, against a 2.5 m reef) that survive global percentile clipping.
+Nearest-valid filling propagated from those blobs, assigning deep-water
+ranges to bright blurry content, and the deep-level red boost turned the
+whole band into a saturated false-red stripe:
+
+![red-band failure diagnosis](docs/images/monofill_redband_diagnosis.png)
+
+The fix, in two layers, validated on the same frame below: the **erosion
+trust filter** (middle column) cuts the thin bridges attaching noise blobs to
+the real region and discards them, which removes most of the band; adding
+**`--colmap-fill-mono`** (right column) patches the hole with MiDaS monocular
+depth aligned per-image to the frame's own valid COLMAP pixels — the aligned
+patch matched the overlap to **0.10 m** median error, the band's depth becomes
+a smooth 2.3 m continuation of the reef, and the red stripe disappears from
+the output entirely:
+
+![mono-fill validation](docs/images/monofill_validation.png)
+
 **Illuminant mode on a deep frame with healthy red signal** (6.3 m, ~6% of
 deep pixels at the noise floor). Water-column mode (third column) clears the
 cyan completely *and* keeps the yellow colony yellow, the pink plates pink,
@@ -573,6 +616,35 @@ the honest rendering — and know your survey's dead-red fraction *before* a
 full run (the QC script reports it; this survey: 92% of frames in good shape):
 
 ![water-column series, noise-floor frame](docs/images/G0020539_watercolumn_series.png)
+
+**Exposure stability between neighbouring frames — the estimator matters.**
+Sea-thru's per-frame contrast stretch silently re-normalises every frame's
+exposure; locking exposure for survey consistency removes that safety net, so
+any instability in the illuminant's overall scale prints straight into output
+brightness. Below: two consecutive frames of the *same* reef patch (raw means
+within 4%, depth within 0.01 m) processed with an early intercept estimator —
+the local-space-average illuminant's scale, aggregated by depth-bin medians.
+The model illuminant `E` (third column) comes out **2.2× apart** on
+near-identical inputs, and the brighter-boosted frame blows out white (45% of
+pixels >0.95 vs 11%):
+
+![white-pair failure](docs/images/whitepair_before.png)
+
+Same two frames after anchoring the intercept to the **direct signal** `I − B`
+and aggregating with a **pixel-weighted** median of `ln(I−B) − b·z` (per-bin
+medians span ~7× within one frame because bright coral tops sit shallow and
+dark crevices deep — bin-weighting lets that minority content set the frame's
+exposure). `E` now agrees within 8% and the outputs match at mean luminance
+0.525 vs 0.532:
+
+![white-pair fixed](docs/images/whitepair_after.png)
+
+The same estimator is used at calibration and at apply time, which is what
+pins the whole survey's output luminance into 0.507–0.539 (measured over the
+QC set spanning 1.5–5.6 m). Note both figures here are at `f = 2.0`; the
+consistency fix and the exposure *level* are orthogonal — the final recipe
+uses `--f 2.4`, which lowers the matched pair to ~10% blown highlights (the
+preferred look) while leaving the frame-to-frame agreement untouched.
 
 ### Results (full 1939-image run with the recipe above)
 
@@ -623,7 +695,7 @@ All tunable knobs live in one place: `seathru.core.SeathruParams` (mirrored
 | Param | CLI flag | Default | Effect |
 | --- | --- | --- | --- |
 | `p` | `--p` | `0.5` | Illuminant locality (Eq. 14 support weight, 0–1). Higher trusts the local pixel over its neighbourhood average. |
-| `f` | `--f` | `2.0` | Illuminant geometry factor (paper uses 2). Raises overall brightness. |
+| `f` | `--f` | `2.0` | Illuminant geometry factor (paper uses 2). In water-column mode this is the **exposure dial**: it sets how far above scene radiance the model illuminant sits, i.e. how much signal saturates *before* the clip. Higher = darker output with more highlight detail (`2.0` ≈ 20% blown highlights on the test reef, `2.4` ≈ 10% — the validated pick, `2.8` ≈ 3–5%). Because the clipped-highlight mass anchors the locked stretch bound near 1.0, changing `f` is **not** cancelled by recalibration. |
 | `l` | `--l` | `1.0` | Attenuation/brightness balance — **the main strength dial**. Lower if far/deep areas over-brighten — **but not on a downward survey**, where lowering it starves the deep correction (see [Downward-looking surveys](#downward-looking-surveys-reefseabed-mapping)). |
 | `attenuation_mode` | `--attenuation-mode` | `two-term` | `two-term` = paper Eq. 11 decaying fit (horizontal imaging). `coarse` = illuminant-derived `β_D` (Eq. 12); **required for downward-looking surveys**. |
 | `illuminant_mode` | `--illuminant-mode` | `local` | `local` = paper Eq. 14 local space-average. `water-column` = per-channel exponential fit in range; preserves relative object colour on downward surveys (see above). |

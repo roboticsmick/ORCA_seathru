@@ -505,7 +505,14 @@ def fit_water_column_illuminant(illum, depths, nmap):
     out = np.empty_like(illum)
     for c in range(3):
         zs, ys = samples[c]
-        b, a = np.polyfit(zs, ys, 1)
+        b, _ = np.polyfit(zs, ys, 1)
+        # Slope from the binned medians (equal weight per depth window), but
+        # the INTERCEPT from a pixel-weighted median: per-bin medians span
+        # ~7x within a frame (reflectance correlates with depth - bright
+        # coral tops shallow, dark crevices deep), so a bin-weighted
+        # intercept jumps between near-identical frames.
+        a = float(np.median(np.log(np.clip(illum[..., c][m], EPS, None))
+                            - b * z_all))
         # Fit on the robust interior (p5-p95 bins) but EXTRAPOLATE over the full
         # valid range: the deepest pixels are precisely where the correction
         # matters most - freezing E at the p95 value leaves residual cyan there.
@@ -931,44 +938,61 @@ def run_seathru(img, depths, params: SeathruParams | None = None) -> SeathruResu
     need_illum = params.return_debug or need_attenuation_fit
     illum = None
     if need_illum:
-        illum = np.stack([
-            estimate_illumination(img[..., c], B[..., c], nmap, n,
-                                  p=params.p, f=params.f)
-            for c in range(3)], axis=2)
         if params.illuminant_mode == "water-column":
+            # Water-column intercepts are anchored to the DIRECT SIGNAL
+            # (img - B), not to the local space-average illuminant. LSAC's
+            # overall scale is unstable on flat frames (its iso-depth
+            # neighbourhood structure fragments chaotically when the depth
+            # span is tiny) — two near-identical frames measured median-E of
+            # 0.31 vs 0.51, i.e. a ~60% brightness jump in the output, which
+            # the locked exposure can no longer re-normalise away. Binned
+            # medians of the direct signal differ by a few percent on the
+            # same pair. params.f plays its usual Sect-4.4.2 role of scaling
+            # E above the scene radiance so J = direct/E stays below 1.
+            direct_ish = np.clip(img - B, EPS, 1.0)
             if locked is not None and locked.wc_illum_coefs is not None:
-                # Locked SLOPE, per-frame INTERCEPT. The depth slope of the
-                # illuminant is a property of the water column — identical for
-                # every frame — so the survey-calibrated value is used and flat
-                # frames never fall back to the local illuminant (a silent
-                # fallback shows up as an abrupt saturation flip between
-                # neighbours). The intercept is a property of the frame
-                # (auto-exposure / auto-white-balance drift) and MUST stay
-                # per-frame: locking it too passes camera AWB drift straight
-                # into the output as whole-frame colour casts.
-                samples = wc_bin_samples(illum, depths, nmap,
-                                         min_relief=0.0, min_bins=1)
-                if samples is not None:
+                # Locked SLOPE, per-frame INTERCEPT: the slope is a property
+                # of the water column (identical for every frame; flat frames
+                # never fall back to the local illuminant), the intercept a
+                # property of the frame's auto-exposure/AWB.
+                #
+                # The intercept is a PIXEL-weighted median of ln(direct)-b·z.
+                # A bin-weighted median (median of per-depth-bin medians) is
+                # unstable here: reflectance correlates with depth inside a
+                # frame (coral tops are bright and shallow, crevices dark and
+                # deep — per-bin medians span ~7x within one frame), so equal-
+                # width bins weight minority crevice content like the bulk
+                # scene and the intercept jumps between near-identical frames
+                # (measured 2.2x E ratio → one frame blown white).
+                m_ok = (depths > 0) & (nmap != 0)
+                if m_ok.sum() >= 500:
                     z_range = (locked.wc_z_range or
                                (float(depths[depths > 0].min()),
                                 float(depths[depths > 0].max())))
                     zz = np.clip(depths, z_range[0], z_range[1])
-                    smooth = np.empty_like(illum)
+                    z_ok = depths[m_ok]
+                    smooth = np.empty_like(img)
                     for c in range(3):
                         b = locked.wc_illum_coefs[c][1]
-                        zs, ys = samples[c]
-                        a = float(np.median(ys - b * zs))
+                        a = float(np.median(np.log(direct_ish[..., c][m_ok])
+                                            - b * z_ok)) + np.log(params.f)
                         smooth[..., c] = np.exp(a + b * zz)
                     illum = np.clip(smooth, EPS, 1.0)
                     notes.append("illum: wc-locked-slope")
-                else:
-                    notes.append("illum: wc-FALLBACK-local (no samples)")
             else:
-                illum, fitted = fit_water_column_illuminant(illum, depths, nmap)
-                notes.append("illum: wc-frame-fit" if fitted
-                             else "illum: wc-FALLBACK-local")
-        else:
-            notes.append("illum: local")
+                fitted_illum, fitted = fit_water_column_illuminant(
+                    direct_ish, depths, nmap)
+                if fitted:
+                    illum = np.clip(params.f * fitted_illum, EPS, 1.0)
+                    notes.append("illum: wc-frame-fit")
+        if illum is None:
+            illum = np.stack([
+                estimate_illumination(img[..., c], B[..., c], nmap, n,
+                                      p=params.p, f=params.f)
+                for c in range(3)], axis=2)
+            notes.append("illum: wc-FALLBACK-local"
+                         if params.illuminant_mode == "water-column"
+                         else "illum: local")
 
     # Locked coefficients are two-term (Eq. 11) fits, so they do not apply in
     # "coarse" mode, where beta_D comes straight from this image's illuminant.
@@ -1115,15 +1139,22 @@ def _fit_calibration_sample(img, depths, params: SeathruParams):
     backscatter_coefs = None if any(c is None for c in back_coefs) else np.stack(back_coefs)
 
     nmap, n = construct_neighborhood_map(depths, params.epsilon, params.min_neighborhood)
-    illum_stack = np.stack([
-        estimate_illumination(img[..., c], B[..., c], nmap, n,
-                              p=params.p, f=params.f)
-        for c in range(3)], axis=2)
-    # Collected from the LOCAL illuminant (pre-fit) so survey calibration can
-    # pool them across frames into one survey-wide water-column model.
-    wc_samples = wc_bin_samples(illum_stack, depths, nmap)
+    # Water-column samples come from the DIRECT SIGNAL (img - B): its binned
+    # medians are stable frame-to-frame, unlike the LSAC illuminant's overall
+    # scale (see the water-column branch in run_seathru). Pooled across the
+    # calibration frames into one survey-wide slope.
+    direct_ish = np.clip(img - B, EPS, 1.0)
+    wc_samples = wc_bin_samples(direct_ish, depths, nmap)
+    illum_stack = None
     if params.illuminant_mode == "water-column":
-        illum_stack, _ = fit_water_column_illuminant(illum_stack, depths, nmap)
+        fitted_illum, ok = fit_water_column_illuminant(direct_ish, depths, nmap)
+        if ok:
+            illum_stack = np.clip(params.f * fitted_illum, EPS, 1.0)
+    if illum_stack is None:
+        illum_stack = np.stack([
+            estimate_illumination(img[..., c], B[..., c], nmap, n,
+                                  p=params.p, f=params.f)
+            for c in range(3)], axis=2)
     illum_channels, atten_coefs = [], []
     for c in range(3):
         illum_c = illum_stack[..., c]
