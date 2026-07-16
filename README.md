@@ -26,31 +26,34 @@ attenuation coefficients, range-dependent attenuation).
 
 ## Contents
 
-- [Install](#install)
-  - [1. The Python library](#1-the-python-library)
-  - [2. COLMAP with CUDA](#2-colmap-with-cuda)
-- [The pipeline: GoPro images + CSV → orthomosaic](#the-pipeline-gopro-images--csv--orthomosaic)
-  - [Step 0 — What you need](#step-0--what-you-need)
-  - [Step 1 — Prepare the COLMAP workspace](#step-1--prepare-the-colmap-workspace)
-  - [Step 2 — Sparse reconstruction](#step-2--sparse-reconstruction)
-  - [Step 3 — Georegister to metres](#step-3--georegister-to-metres)
-  - [Step 4 — Dense metric depth](#step-4--dense-metric-depth)
-  - [Step 5 — Sanity-check and tune on samples](#step-5--sanity-check-and-tune-on-samples)
-  - [Step 6 — Sea-thru colour correction](#step-6--sea-thru-colour-correction)
-  - [Step 7 — Build the orthomosaic](#step-7--build-the-orthomosaic)
-  - [Where next: Gaussian splats](#where-next-gaussian-splats)
-  - [Time budget](#time-budget)
-- [Improvements over the original Sea-thru](#improvements-over-the-original-sea-thru)
-- [Survey-locked mode](#survey-locked-mode)
-- [Configuration / tunable parameters](#configuration--tunable-parameters)
-- [Other depth sources](#other-depth-sources)
-- [Large datasets (10k+ images)](#large-datasets-10k-images)
-- [Tuning tools](#tuning-tools)
-- [How it maps to the paper](#how-it-maps-to-the-paper)
-- [Deviations from the paper (documented)](#deviations-from-the-paper-documented)
-- [Limitations](#limitations)
-- [Citing](#citing)
-- [License](#license)
+- [seathru-orca](#seathru-orca)
+  - [Contents](#contents)
+  - [Install](#install)
+    - [1. The Python library](#1-the-python-library)
+    - [2. COLMAP with CUDA](#2-colmap-with-cuda)
+  - [The pipeline: GoPro images + CSV → orthomosaic](#the-pipeline-gopro-images--csv--orthomosaic)
+    - [Step 0 — What you need](#step-0--what-you-need)
+    - [Step 1 — Prepare the COLMAP workspace](#step-1--prepare-the-colmap-workspace)
+    - [Step 2 — Sparse reconstruction](#step-2--sparse-reconstruction)
+    - [Step 3 — Georegister to metres](#step-3--georegister-to-metres)
+    - [Step 4 — Dense metric depth](#step-4--dense-metric-depth)
+    - [Step 5 — Sanity-check and tune on samples](#step-5--sanity-check-and-tune-on-samples)
+    - [Step 6 — Sea-thru colour correction](#step-6--sea-thru-colour-correction)
+    - [Step 7 — Build the orthomosaic](#step-7--build-the-orthomosaic)
+    - [Where next: Gaussian splats](#where-next-gaussian-splats)
+    - [Time budget](#time-budget)
+  - [Improvements over the original Sea-thru](#improvements-over-the-original-sea-thru)
+  - [Survey-locked mode](#survey-locked-mode)
+  - [Configuration / tunable parameters](#configuration--tunable-parameters)
+  - [Other depth sources](#other-depth-sources)
+  - [Large datasets (10k+ images)](#large-datasets-10k-images)
+  - [Tuning tools](#tuning-tools)
+  - [How it maps to the paper](#how-it-maps-to-the-paper)
+  - [Deviations from the paper (documented)](#deviations-from-the-paper-documented)
+  - [Limitations](#limitations)
+  - [Citing](#citing)
+  - [License](#license)
+  - [Want to Support Me](#want-to-support-me)
 
 ## Install
 
@@ -681,3 +684,7 @@ If you use this software, please cite the original method:
 
 MIT for the code in this repository. The Sea-thru method itself is the
 intellectual work of Akkaynak & Treibitz — cite them.
+
+## Want to Support Me
+
+If you use this for your own work, and you're not a student, and you want to thank me, feel free to buy me a [ST-VIS-25 spectrometer](https://www.oceanoptics.com/spectrometer/st-vis/), or a [Headwall hyperspectral MV.C VNIR camera](https://www.automate.org/products/headwall-photonics/mv-c-vnir) or a [Specim FX10 Hyperspectral Camera](https://www.specim.com/products/specim-fx10/), or a [OAK 4 CS Global Shutter camera](https://shop.luxonis.com/products/oak-4-cs) so I can keep making cool ROS2 camera packages in my spare time ❤️
