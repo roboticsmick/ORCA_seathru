@@ -1,4 +1,4 @@
-# seathru-orca
+# ORCA seathru
 
 A Python pipeline of **Sea-thru** — the physically based underwater
 colour-restoration method from:
@@ -26,7 +26,7 @@ attenuation coefficients, range-dependent attenuation).
 
 ## Contents
 
-- [seathru-orca](#seathru-orca)
+- [ORCA seathru](#orca-seathru)
   - [Contents](#contents)
   - [Install](#install)
     - [1. The Python library](#1-the-python-library)
@@ -67,8 +67,8 @@ Python 3.9–3.12 (3.12 recommended — the monocular depth patching needs
 PyTorch, which has no wheels for newer interpreters yet).
 
 ```bash
-git clone https://github.com/roboticsmick/seathru_python.git
-cd seathru_python
+git clone https://github.com/roboticsmick/ORCA_seathru.git
+cd ORCA_seathru
 
 python3 -m venv venv && source venv/bin/activate
 pip install --upgrade pip
@@ -150,7 +150,7 @@ true-orthomosaic: fused DSM + most-nadir rendering → GeoTIFF (QGIS-ready)
 Every command below is copy-paste runnable with three variables:
 
 ```bash
-export REPO=/path/to/seathru_python   # this repository
+export REPO=/path/to/ORCA_seathru     # this repository
 export T=/path/to/my_survey           # dataset root
 export PATH="$HOME/.local/bin:$PATH"  # for the local COLMAP install
 ```
@@ -406,20 +406,15 @@ floater problem at the source: joint methods (e.g. SeaSplat) spend their
 first ~10k iterations fitting raw hazy images, so the optimizer explains
 backscatter by placing semi-transparent Gaussians in the water column —
 whereas water-free images from iteration 0 give those floaters nothing to
-explain. The recipe:
+explain.
 
-1. **Dataset**: the renamed corrected images (`Step 6`) as `images/`, and
-   `$T/colmap/dense/sparse` as `sparse/0` — the undistorted PINHOLE model
-   matches the corrected pixels 1:1.
-2. **Depth supervision**: [docs/make_gt_depth.py](docs/make_gt_depth.py)
-   converts the COLMAP depth maps to per-image `.npy` for a depth-L1 loss —
-   the main training-time floater killer.
-3. **Scene bounding box**: hard-limit Gaussian Z to the seabed envelope; the
-   orthomosaic's DSM pass prints it (test survey: −5.3…−1.4 m, so e.g.
-   `zlo −6.5, zhi −0.5` — real metres, the model is georegistered).
-4. **Mask/prune**: delete any Gaussian farther than ~10–20 cm from the
-   depth-map point cloud (KD-tree over the projected points).
-5. Keep stock SeaSplat as the joint-optimisation comparison baseline.
+That pipeline — chunked training with depth-L1 supervision from the same
+hygiene-filtered depth maps, seafloor cropping against the orthomosaic DSM,
+and merging back to a single `.ply` — lives in its own repository,
+[ORCA_splat](https://github.com/roboticsmick/ORCA_splat), which pulls this
+repo and COLMAP in as submodules. Kept separate because the splat trainer is
+a fork of SeaSplat/Inria 3DGS under a non-commercial research licence, which
+must not mix into this MIT tree.
 
 ### Time budget
 

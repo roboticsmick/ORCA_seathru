@@ -131,7 +131,7 @@ colmap patch_match_stereo -h >/dev/null && echo dense-ok
 ### 1.3 Sea-thru library
 
 ```bash
-cd seathru_python
+cd ORCA_seathru
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[debug]"
 python -m seathru.cli --help

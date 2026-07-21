@@ -24,6 +24,10 @@ micmac/
 # Development testing files
 /dev/
 
+# Gaussian splatting work — lives in ORCA_splat (separate licence)
+/seasplat/
+/scripts/*splat*
+
 .DS_Store
 Thumbs.db
 docs/images/*.tif

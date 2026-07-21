@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "seathru_python"
+name = "orca-seathru"
 version = "0.1.0"
 description = "Physically based removal of water from underwater images (Sea-thru, CVPR 2019) for ORCA ASV reef mapping"
 readme = "README.md"
