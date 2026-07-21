@@ -11,6 +11,8 @@ colour-restoration method from:
 
 ![Sea-thru corrected orthomosaic](docs/images/orthomosaic_preview.jpg)
 
+![Sea-thru splat](docs/images/seathru_splat.png)
+
 *A 2,022-image GoPro survey from an autonomous surface vehicle, turned into a
 single water-free, georeferenced 3 mm orthomosaic (~20 × 20 m of reef,
 EPSG:32755) — every step below, no manual editing.*
